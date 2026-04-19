@@ -4,6 +4,9 @@ import XCTest
 /// Runs as a UI test that attaches to any app via bundle ID.
 /// Communicates results via OCQA_ prefixed stdout markers.
 ///
+/// Fully generalized — no app-specific logic. Uses depth-first exploration
+/// that prioritizes in-screen content over persistent navigation (tab bars).
+///
 /// Modes:
 /// - testAutonomousExploration: Full autonomous exploration loop
 /// - testDumpUITree: One-shot accessibility tree dump
@@ -13,6 +16,8 @@ class ExplorerTests: XCTestCase {
 
     var app: XCUIApplication!
     var config: [String: String] = [:]
+    /// Detected once at setUp; avoids hardcoded device dimensions
+    private var screenBounds: CGRect = .zero
 
     var targetBundleId: String { config["OCQA_BUNDLE_ID"] ?? ProcessInfo.processInfo.environment["OCQA_BUNDLE_ID"] ?? "" }
     var maxActions: Int { Int(config["OCQA_MAX_ACTIONS"] ?? ProcessInfo.processInfo.environment["OCQA_MAX_ACTIONS"] ?? "200") ?? 200 }
@@ -42,11 +47,37 @@ class ExplorerTests: XCTestCase {
         } else {
             app = XCUIApplication()
         }
+
+        // Handle system alerts (location, notifications, tracking, etc.)
+        addUIInterruptionMonitor(withDescription: "System Alert") { alert in
+            let allowLabels = ["Allow", "Allow While Using App", "OK", "Continue", "Allow Full Access"]
+            for label in allowLabels {
+                let btn = alert.buttons[label]
+                if btn.exists {
+                    btn.tap()
+                    return true
+                }
+            }
+            if alert.buttons.count > 0 {
+                alert.buttons.element(boundBy: 0).tap()
+                return true
+            }
+            return false
+        }
+
         app.activate()
         let started = app.wait(for: .runningForeground, timeout: 10)
         if !started {
             app.launch()
             _ = app.wait(for: .runningForeground, timeout: 10)
+        }
+
+        // Detect actual screen dimensions from the running app
+        let windowFrame = app.windows.firstMatch.frame
+        if windowFrame.width > 0 && windowFrame.height > 0 {
+            screenBounds = windowFrame
+        } else {
+            screenBounds = app.frame
         }
     }
 
@@ -190,10 +221,12 @@ class ExplorerTests: XCTestCase {
         var actionCounts: [String: Int] = [:]
         var previousStateHash: String?
         var repeatedStateCount = 0
-        var didToggleRewardsToRedeem = false
         var actionCount = 0
         var issues: [(type: String, severity: String, title: String, desc: String)] = []
         var screenTitles: [String: String] = [:] // hash -> title
+        /// Tracks element keys that appear in multiple distinct screen hashes — likely persistent nav
+        var elementScreenPresence: [String: Set<String>] = [:]
+        var totalDistinctStates = 0
         let startTime = Date()
 
         if !targetBundleId.isEmpty {
@@ -201,9 +234,23 @@ class ExplorerTests: XCTestCase {
         } else {
             app.launch()
         }
-        Thread.sleep(forTimeInterval: 2.0)
+
+        // Wait for app to settle — poll until element count stabilizes
+        var lastCount = 0
+        for _ in 0..<5 {
+            Thread.sleep(forTimeInterval: 0.4)
+            let query = app.descendants(matching: .any)
+            _ = query.firstMatch.waitForExistence(timeout: 3)
+            let count = query.count
+            if count > 10 && count == lastCount { break }
+            lastCount = count
+        }
 
         print("OCQA_STATE:exploration_started max_actions=\(maxActions)")
+
+        // Trigger the interruption monitor on any pending system alerts
+        app.tap()
+        Thread.sleep(forTimeInterval: 0.3)
 
         while actionCount < maxActions {
             if Date().timeIntervalSince(startTime) > timeoutSeconds {
@@ -212,12 +259,20 @@ class ExplorerTests: XCTestCase {
             }
 
             let elements = readUITree(app)
-            let flat = flattenElements(elements)
-            let stateHash = computeHash(flat)
-            let screenTitle = detectTitle(flat)
+            let stateHash = computeHash(elements)
+            let screenTitle = detectTitle(elements)
 
             if let title = screenTitle {
                 screenTitles[stateHash] = title
+            }
+
+            // Track which elements appear on which screens (for persistent-nav detection)
+            if !visitedStates.contains(stateHash) {
+                totalDistinctStates += 1
+                for el in elements where el.isEnabled && isInteractable(el.type) {
+                    let key = actionKey(for: el)
+                    elementScreenPresence[key, default: []].insert(stateHash)
+                }
             }
 
             if previousStateHash == stateHash {
@@ -229,10 +284,10 @@ class ExplorerTests: XCTestCase {
 
             visitedStates.insert(stateHash)
 
-            // Emit screen state — desktop app parses this
+            // Emit screen state
             let titleStr = screenTitle ?? "Unknown"
-            let escapedTitle = titleStr.replacingOccurrences(of: "\"", with: "'")
-            print("OCQA_STATE:{\"screen\":\"\(escapedTitle)\",\"hash\":\"\(stateHash)\",\"elements\":\(flat.count),\"action\":\(actionCount)}")
+            let escapedTitle = escapeJSON(titleStr)
+            print("OCQA_STATE:{\"screen\":\"\(escapedTitle)\",\"hash\":\"\(stateHash)\",\"elements\":\(elements.count),\"action\":\(actionCount)}")
 
             // Screenshot
             let screenshot = app.screenshot()
@@ -241,47 +296,29 @@ class ExplorerTests: XCTestCase {
             attachment.lifetime = .keepAlways
             add(attachment)
 
-            let interactable = flat.filter { $0.isEnabled && $0.isHittable && isInteractable($0.type) }
+            let interactable = elements.filter { $0.isEnabled && $0.isHittable && isInteractable($0.type) }
 
-            // ---- Special case: Rewards Earn/Redeem toggle ----
-            let onRewardsScreen = flat.contains(where: { $0.identifier == "resident.rewards.screen" })
-            let showingEarnMode = flat.contains(where: { $0.identifier == "resident.rewards.earnHeader" })
-            let showingRedeemMode = flat.contains(where: { $0.identifier == "resident.rewards.redeemHeader" })
-
-            if onRewardsScreen && showingEarnMode && !didToggleRewardsToRedeem {
-                if let redeemSegment = flat.first(where: {
-                    $0.identifier == "resident.rewards.modePicker" &&
-                    $0.label.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "redeem"
-                }) {
-                    let actionDesc = performCoordinateTap(in: app, at: CGPoint(x: redeemSegment.frame.midX, y: redeemSegment.frame.midY), label: "Redeem")
-                    didToggleRewardsToRedeem = true
+            // ---- Repeated state: try scroll, then go back ----
+            if repeatedStateCount >= 3 {
+                if repeatedStateCount <= 4 {
+                    let direction = repeatedStateCount == 3
+                    let _ = performScroll(in: app, upward: direction)
                     actionCount += 1
-                    print("OCQA_ACTION:{\"type\":\"tap\",\"target\":\"Redeem\",\"step\":\(actionCount)}")
-                    Thread.sleep(forTimeInterval: 0.8)
+                    let dirStr = direction ? "up" : "down"
+                    print("OCQA_ACTION:{\"type\":\"scroll\",\"direction\":\"\(dirStr)\",\"step\":\(actionCount)}")
+                    Thread.sleep(forTimeInterval: 0.5)
                     emitProgress(action: actionCount, maxActions: maxActions, states: visitedStates.count)
                     continue
+                } else {
+                    if tryGoBack() {
+                        actionCount += 1
+                        print("OCQA_ACTION:{\"type\":\"back\",\"reason\":\"stuck\",\"step\":\(actionCount)}")
+                        Thread.sleep(forTimeInterval: 0.5)
+                        repeatedStateCount = 0
+                        emitProgress(action: actionCount, maxActions: maxActions, states: visitedStates.count)
+                        continue
+                    }
                 }
-                if let redeemTab = interactable.first(where: {
-                    $0.label.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "redeem"
-                }) {
-                    let _ = performSmartAction(on: redeemTab, in: app)
-                    didToggleRewardsToRedeem = true
-                    actionCount += 1
-                    print("OCQA_ACTION:{\"type\":\"tap\",\"target\":\"Redeem\",\"step\":\(actionCount)}")
-                    Thread.sleep(forTimeInterval: 0.8)
-                    emitProgress(action: actionCount, maxActions: maxActions, states: visitedStates.count)
-                    continue
-                }
-            }
-
-            // ---- Repeated state: try scrolling ----
-            if repeatedStateCount >= 2 {
-                let _ = performScroll(in: app, upward: true)
-                actionCount += 1
-                print("OCQA_ACTION:{\"type\":\"scroll\",\"direction\":\"up\",\"step\":\(actionCount)}")
-                Thread.sleep(forTimeInterval: 0.8)
-                emitProgress(action: actionCount, maxActions: maxActions, states: visitedStates.count)
-                continue
             }
 
             // ---- Dead end ----
@@ -295,27 +332,33 @@ class ExplorerTests: XCTestCase {
             }
 
             // ---- Pick and execute action ----
-            let sorted = prioritizeElements(interactable)
-            let sortedNoPickerContainer = sorted.filter { $0.identifier != "resident.rewards.modePicker" }
-            let candidatePool = sortedNoPickerContainer.isEmpty ? sorted : sortedNoPickerContainer
-            let target = candidatePool.first(where: { element in
+            let persistentThreshold = max(2, totalDistinctStates / 2)
+            let sorted = prioritizeElements(interactable, actionCounts: actionCounts,
+                                            elementScreenPresence: elementScreenPresence,
+                                            persistentThreshold: persistentThreshold,
+                                            screenBounds: screenBounds)
+
+            let target = sorted.first(where: { element in
                 let key = actionKey(for: element)
-                return (actionCounts[key] ?? 0) < 2
-            }) ?? candidatePool.first
+                return (actionCounts[key] ?? 0) < 3
+            }) ?? sorted.first
             guard let target else { break }
+
+            if !isTextField(target.type) {
+                dismissKeyboardIfNeeded()
+            }
 
             let actionDesc = performSmartAction(on: target, in: app)
             actionCounts[actionKey(for: target), default: 0] += 1
             actionCount += 1
 
-            // Emit action with detail for the desktop app
             let targetName = target.identifier.isEmpty ? target.label : target.identifier
-            let escapedTarget = targetName.replacingOccurrences(of: "\"", with: "'")
-            let actionType = (target.type.contains("TextField") || target.type.contains("SecureTextField") ||
-                              target.type.contains("rawValue: 49") || target.type.contains("rawValue: 50")) ? "type" : "tap"
+            let escapedTarget = escapeJSON(targetName)
+            let actionType = isTextField(target.type) ? "type" : "tap"
             print("OCQA_ACTION:{\"type\":\"\(actionType)\",\"target\":\"\(escapedTarget)\",\"elementType\":\"\(target.type)\",\"step\":\(actionCount),\"x\":\(Int(target.frame.midX)),\"y\":\(Int(target.frame.midY))}")
 
-            Thread.sleep(forTimeInterval: 0.8)
+            Thread.sleep(forTimeInterval: 0.5)
+            waitForAnimationsToSettle()
 
             // ---- Crash detection ----
             if !app.exists {
@@ -328,38 +371,30 @@ class ExplorerTests: XCTestCase {
                 if !app.exists { break }
             }
 
-            // ---- Track transition ----
-            let newElements = readUITree(app)
-            let newFlat = flattenElements(newElements)
-            let newHash = computeHash(newFlat)
-            stateTransitions.append((from: stateHash, to: newHash, action: actionDesc))
+            // ---- Track transition (lightweight — full tree read deferred to next iteration) ----
+            let postCount = app.descendants(matching: .any).count
+            let cheapHash = String(format: "%08x", postCount ^ (postCount << 13))
+            stateTransitions.append((from: stateHash, to: cheapHash, action: actionDesc))
 
-            // Emit transition for flow map
-            let newTitle = detectTitle(newFlat) ?? "Unknown"
-            let escapedNewTitle = newTitle.replacingOccurrences(of: "\"", with: "'")
-            print("OCQA_TRANSITION:{\"from\":\"\(escapedTitle)\",\"fromHash\":\"\(stateHash)\",\"to\":\"\(escapedNewTitle)\",\"toHash\":\"\(newHash)\",\"action\":\"\(escapedTarget)\"}")
+            print("OCQA_TRANSITION:{\"from\":\"\(escapedTitle)\",\"fromHash\":\"\(stateHash)\",\"to\":\"pending\",\"toHash\":\"\(cheapHash)\",\"action\":\"\(escapedTarget)\"}")
 
             // ---- Loop detection ----
-            let recentStates = stateTransitions.suffix(6).map(\.to)
-            if recentStates.count >= 6 && Set(recentStates).count <= 2 {
-                if !(onRewardsScreen && (showingEarnMode || showingRedeemMode)) {
-                    issues.append((type: "navigation_loop", severity: "high",
-                                   title: "Navigation loop detected on \(titleStr)",
-                                   desc: "Stuck cycling between states"))
-                    print("OCQA_ISSUE:{\"type\":\"navigation_loop\",\"severity\":\"high\",\"title\":\"Navigation loop on \(escapedTitle)\",\"screen\":\"\(escapedTitle)\",\"step\":\(actionCount)}")
-                }
+            let recentStates = stateTransitions.suffix(8).map(\.to)
+            if recentStates.count >= 8 && Set(recentStates).count <= 2 {
+                issues.append((type: "navigation_loop", severity: "high",
+                               title: "Navigation loop detected on \(titleStr)",
+                               desc: "Stuck cycling between states"))
+                print("OCQA_ISSUE:{\"type\":\"navigation_loop\",\"severity\":\"high\",\"title\":\"Navigation loop on \(escapedTitle)\",\"screen\":\"\(escapedTitle)\",\"step\":\(actionCount)}")
                 if !tryGoBack() { break }
             }
 
             emitProgress(action: actionCount, maxActions: maxActions, states: visitedStates.count)
         }
 
-        // ---- Emit summary ----
         let uniqueScreens = screenTitles.values
         let screenList = Array(Set(uniqueScreens)).sorted().joined(separator: ",")
         print("OCQA_COMPLETE:{\"actions\":\(actionCount),\"states\":\(visitedStates.count),\"issues\":\(issues.count),\"screens\":\"\(screenList)\"}")
 
-        // Final screenshot
         let finalScreenshot = app.screenshot()
         let finalAttachment = XCTAttachment(screenshot: finalScreenshot)
         finalAttachment.name = "final_state"
@@ -380,12 +415,65 @@ class ExplorerTests: XCTestCase {
     }
 
     private func readUITree(_ app: XCUIApplication) -> [SimpleElement] {
+        // Try snapshot-based read first — single IPC call, ~100x faster
+        if let elements = readViaSnapshot(app), !elements.isEmpty {
+            return elements
+        }
+        // Fallback to element-by-element read (pre-Xcode 15 or snapshot failure)
+        return readElementByElement(app)
+    }
+
+    /// Reads the full UI tree via a single snapshot() call — dramatically faster than
+    /// per-element queries since it's one IPC round-trip for the entire hierarchy.
+    private func readViaSnapshot(_ app: XCUIApplication) -> [SimpleElement]? {
+        guard let snapshot = try? app.snapshot() else { return nil }
+
+        var elements: [SimpleElement] = []
+        let limit = 200
+        let safeScreen = screenBounds.width > 0 ? screenBounds : CGRect(x: 0, y: 0, width: 500, height: 1000)
+
+        func walk(_ snap: XCUIElementSnapshot) {
+            guard elements.count < limit else { return }
+
+            let frame = snap.frame
+            if frame.width > 0, frame.height > 0,
+               frame.origin.x.isFinite, frame.origin.y.isFinite,
+               frame.width.isFinite, frame.height.isFinite {
+
+                let hittable = snap.isEnabled && safeScreen.contains(CGPoint(x: frame.midX, y: frame.midY))
+                elements.append(SimpleElement(
+                    type: String(describing: snap.elementType),
+                    identifier: snap.identifier,
+                    label: snap.label ?? "",
+                    frame: frame,
+                    isEnabled: snap.isEnabled,
+                    isHittable: hittable,
+                    xcElement: nil
+                ))
+            }
+
+            for child in snap.children {
+                guard elements.count < limit else { return }
+                if let childSnap = child as? XCUIElementSnapshot {
+                    walk(childSnap)
+                }
+            }
+        }
+
+        walk(snapshot)
+        return elements
+    }
+
+    /// Fallback element-by-element read — slower but works on all Xcode versions.
+    private func readElementByElement(_ app: XCUIApplication) -> [SimpleElement] {
         var elements: [SimpleElement] = []
         let query = app.descendants(matching: .any)
-        _ = query.firstMatch.waitForExistence(timeout: 10)
+        _ = query.firstMatch.waitForExistence(timeout: 5)
         let count = query.count
 
-        for i in 0..<min(count, 200) {
+        let safeScreen = screenBounds.width > 0 ? screenBounds : CGRect(x: 0, y: 0, width: 500, height: 1000)
+
+        for i in 0..<min(count, 150) {
             let el = query.element(boundBy: i)
             guard el.exists else { continue }
 
@@ -394,12 +482,7 @@ class ExplorerTests: XCTestCase {
                   frame.origin.x.isFinite, frame.origin.y.isFinite,
                   frame.width.isFinite, frame.height.isFinite else { continue }
 
-            // Infer hittability from frame position vs screen bounds
-            // Avoids calling el.isHittable which crashes on off-screen elements
-            let screenW: CGFloat = 440
-            let screenH: CGFloat = 956
-            let screenRect = CGRect(x: 0, y: 0, width: screenW, height: screenH)
-            let hittable = el.isEnabled && screenRect.contains(CGPoint(x: frame.midX, y: frame.midY))
+            let hittable = el.isEnabled && safeScreen.contains(CGPoint(x: frame.midX, y: frame.midY))
 
             elements.append(SimpleElement(
                 type: String(describing: el.elementType),
@@ -414,10 +497,6 @@ class ExplorerTests: XCTestCase {
         return elements
     }
 
-    private func flattenElements(_ elements: [SimpleElement]) -> [SimpleElement] {
-        return elements
-    }
-
     private func actionKey(for element: SimpleElement) -> String {
         let id = element.identifier.trimmingCharacters(in: .whitespacesAndNewlines)
         if !id.isEmpty { return "id:\(id)" }
@@ -426,7 +505,6 @@ class ExplorerTests: XCTestCase {
         return "frame:\(Int(element.frame.midX))x\(Int(element.frame.midY))"
     }
 
-    /// djb2 hash of element structure — fingerprints the current screen
     private func computeHash(_ elements: [SimpleElement]) -> String {
         let structure = elements.map { "\($0.type):\($0.identifier):\($0.isEnabled)" }.joined(separator: "|")
         var hash: UInt64 = 5381
@@ -437,14 +515,15 @@ class ExplorerTests: XCTestCase {
     }
 
     private func detectTitle(_ elements: [SimpleElement]) -> String? {
-        // Try NavigationBar first
-        if let navTitle = elements.first(where: { $0.type.contains("NavigationBar") }) {
+        // NavigationBar = rawValue: 74
+        if let navTitle = elements.first(where: { $0.type.contains("rawValue: 74") || $0.type.contains("NavigationBar") }) {
             if !navTitle.identifier.isEmpty { return navTitle.identifier }
             if !navTitle.label.isEmpty { return navTitle.label }
         }
-        // Fall back to largest static text in top 200px
+        let topThreshold = screenBounds.height > 0 ? screenBounds.height * 0.25 : 200.0
+        // StaticText = rawValue: 48
         let topTexts = elements
-            .filter { $0.type.contains("StaticText") && $0.frame.minY < 200 && !$0.label.isEmpty }
+            .filter { ($0.type.contains("rawValue: 48") || $0.type.contains("StaticText")) && $0.frame.minY < topThreshold && !$0.label.isEmpty }
             .sorted { ($0.frame.width * $0.frame.height) > ($1.frame.width * $1.frame.height) }
         return topTexts.first?.label
     }
@@ -455,29 +534,57 @@ class ExplorerTests: XCTestCase {
             if type.contains("rawValue: \(rv)") { return true }
         }
         let types = ["Button", "TextField", "SecureTextField", "Link", "Cell",
-                     "Switch", "Slider", "Tab", "MenuItem", "SegmentedControl"]
+                     "Switch", "Slider", "Tab", "MenuItem", "SegmentedControl",
+                     "Picker", "Toggle", "Stepper", "DatePicker"]
         return types.contains(where: { type.contains($0) })
     }
 
-    /// Priority-weighted element selection:
-    /// Button=5, Cell/Tab=4, Link=3, TextField=2, Switch=1
-    /// Elements are shuffled first for variety, then sorted by priority
-    private func prioritizeElements(_ elements: [SimpleElement]) -> [SimpleElement] {
-        let priority: [(String, Int)] = [
-            ("rawValue: 9", 5), ("rawValue: 75", 4), ("rawValue: 53", 4), ("rawValue: 39", 3),
-            ("rawValue: 49", 2), ("rawValue: 50", 2), ("rawValue: 40", 1),
-            ("Button", 5), ("Cell", 4), ("Tab", 4), ("Link", 3),
-            ("TextField", 2), ("SecureTextField", 2), ("Switch", 1)
-        ]
-        return elements.shuffled().sorted { a, b in
-            let pa = priority.first(where: { a.type.contains($0.0) })?.1 ?? 0
-            let pb = priority.first(where: { b.type.contains($0.0) })?.1 ?? 0
+    private func isTextField(_ type: String) -> Bool {
+        return type.contains("TextField") || type.contains("SecureTextField") ||
+               type.contains("rawValue: 49") || type.contains("rawValue: 50")
+    }
+
+    private func prioritizeElements(
+        _ elements: [SimpleElement],
+        actionCounts: [String: Int],
+        elementScreenPresence: [String: Set<String>],
+        persistentThreshold: Int,
+        screenBounds: CGRect
+    ) -> [SimpleElement] {
+        let bottomBarY = screenBounds.height > 0 ? screenBounds.height * 0.88 : 850.0
+
+        return elements.sorted { a, b in
+            let keyA = actionKey(for: a)
+            let keyB = actionKey(for: b)
+
+            let persistA = (elementScreenPresence[keyA]?.count ?? 0) >= persistentThreshold
+            let persistB = (elementScreenPresence[keyB]?.count ?? 0) >= persistentThreshold
+            if persistA != persistB { return !persistA }
+
+            let countA = actionCounts[keyA] ?? 0
+            let countB = actionCounts[keyB] ?? 0
+            if countA != countB { return countA < countB }
+
+            let inBarA = a.frame.midY > bottomBarY
+            let inBarB = b.frame.midY > bottomBarY
+            if inBarA != inBarB { return !inBarA }
+
+            let pa = baseTypePriority(a.type)
+            let pb = baseTypePriority(b.type)
             return pa > pb
         }
     }
 
-    /// Smart action: coordinate-based tap (or type for text fields)
-    /// Uses coordinate taps to avoid XCUITest isHittable crashes
+    private func baseTypePriority(_ type: String) -> Int {
+        if type.contains("Cell") || type.contains("rawValue: 75") { return 5 }
+        if type.contains("Link") || type.contains("rawValue: 39") { return 4 }
+        if type.contains("Button") || type.contains("rawValue: 9") { return 4 }
+        if type.contains("SegmentedControl") || type.contains("Picker") { return 3 }
+        if type.contains("TextField") || type.contains("rawValue: 49") || type.contains("rawValue: 50") { return 2 }
+        if type.contains("Switch") || type.contains("Toggle") || type.contains("rawValue: 40") { return 1 }
+        return 0
+    }
+
     private func performSmartAction(on element: SimpleElement, in app: XCUIApplication) -> String {
         let frame = element.frame
         guard frame.width > 0, frame.height > 0 else {
@@ -487,17 +594,48 @@ class ExplorerTests: XCTestCase {
         let coord = app.coordinate(withNormalizedOffset: .zero)
             .withOffset(CGVector(dx: frame.midX, dy: frame.midY))
 
-        if element.type.contains("TextField") || element.type.contains("SecureTextField") ||
-           element.type.contains("rawValue: 49") || element.type.contains("rawValue: 50") {
+        if isTextField(element.type) {
             coord.tap()
             Thread.sleep(forTimeInterval: 0.3)
-            let testText = element.identifier.lowercased().contains("email") ? "test@example.com" :
-                          element.identifier.lowercased().contains("password") ? "TestPass123" :
-                          "test input"
+            let hint = (element.identifier + " " + element.label).lowercased()
+            let testText: String
+            if hint.contains("email") || hint.contains("e-mail") {
+                testText = "test@example.com"
+            } else if hint.contains("password") || hint.contains("passcode") {
+                testText = "TestPass123!"
+            } else if hint.contains("phone") || hint.contains("mobile") {
+                testText = "5551234567"
+            } else if hint.contains("name") || hint.contains("first") || hint.contains("last") {
+                testText = "Test User"
+            } else if hint.contains("zip") || hint.contains("postal") {
+                testText = "90210"
+            } else if hint.contains("search") {
+                testText = "test"
+            } else {
+                testText = "test input"
+            }
             if let xcEl = element.xcElement, xcEl.exists {
                 xcEl.typeText(testText)
+            } else {
+                // Snapshot-based element — resolve text field for typing
+                let resolved: XCUIElement? = {
+                    if !element.identifier.isEmpty {
+                        let tf = app.textFields[element.identifier]
+                        if tf.exists { return tf }
+                        let stf = app.secureTextFields[element.identifier]
+                        if stf.exists { return stf }
+                    }
+                    // Fallback: try the first focused text field
+                    let tf = app.textFields.firstMatch
+                    if tf.exists { return tf }
+                    let stf = app.secureTextFields.firstMatch
+                    if stf.exists { return stf }
+                    return nil
+                }()
+                resolved?.typeText(testText)
             }
-            return "type(\(element.identifier.isEmpty ? element.label : element.identifier), \"\(testText)\")"
+            let name = element.identifier.isEmpty ? element.label : element.identifier
+            return "type(\(name), \"\(testText)\")"
         }
 
         coord.tap()
@@ -514,7 +652,14 @@ class ExplorerTests: XCTestCase {
                 return true
             }
         }
-        // Swipe from left edge
+        for label in ["Close", "Cancel", "Done", "Dismiss"] {
+            let btn = app.buttons[label]
+            if btn.exists && btn.isHittable {
+                btn.tap()
+                Thread.sleep(forTimeInterval: 0.5)
+                return true
+            }
+        }
         let start = app.coordinate(withNormalizedOffset: CGVector(dx: 0.02, dy: 0.5))
         let end = app.coordinate(withNormalizedOffset: CGVector(dx: 0.8, dy: 0.5))
         start.press(forDuration: 0.05, thenDragTo: end)
@@ -536,6 +681,27 @@ class ExplorerTests: XCTestCase {
             .withOffset(CGVector(dx: point.x, dy: point.y))
         coord.tap()
         return "tap(\(label))"
+    }
+
+    private func waitForAnimationsToSettle() {
+        Thread.sleep(forTimeInterval: 0.3)
+    }
+
+    private func dismissKeyboardIfNeeded() {
+        let keyboard = app.keyboards.firstMatch
+        if keyboard.exists && keyboard.frame.height > 0 {
+            let aboveKeyboard = app.coordinate(withNormalizedOffset: .zero)
+                .withOffset(CGVector(dx: screenBounds.width / 2, dy: keyboard.frame.minY - 20))
+            aboveKeyboard.tap()
+            Thread.sleep(forTimeInterval: 0.3)
+        }
+    }
+
+    private func escapeJSON(_ str: String) -> String {
+        return str
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "'")
+            .replacingOccurrences(of: "\n", with: " ")
     }
 
     private func emitUITree(_ state: (title: String?, elements: [SimpleElement])) {
