@@ -1,51 +1,89 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Deploy OpenClawQA to Taylor's Mac and build
-MAC_HOST="taylorolsen-vogt@100.125.133.123"
-REMOTE_DIR="~/repos/OpenClawQA"
+# Build OpenClawQA locally on this Mac
+# Usage: ./scripts/deploy-and-build.sh [--harness] [--clean]
+#   --harness  Also build the OCQAHarness XCUITest bundle
+#   --clean    Clean derived data before building
+
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-SSH_OPTS="-o BatchMode=yes -o ConnectTimeout=10"
+BUILD_HARNESS=0
+DO_CLEAN=0
 
-echo "=== OpenClawQA Deploy & Build ==="
-echo "Source: $PROJECT_ROOT"
-echo "Target: $MAC_HOST:$REMOTE_DIR"
+for arg in "$@"; do
+  case "$arg" in
+    --harness) BUILD_HARNESS=1 ;;
+    --clean) DO_CLEAN=1 ;;
+  esac
+done
+
+echo "=== OpenClawQA Local Build ==="
+echo "Project: $PROJECT_ROOT"
 echo ""
 
-# Step 1: Sync project to Mac
-echo "📦 Syncing project to Mac..."
-ssh $SSH_OPTS "$MAC_HOST" "mkdir -p $REMOTE_DIR"
-rsync -avz --delete \
-  --exclude '.git/' \
-  --exclude 'build/' \
-  --exclude 'DerivedData/' \
-  --exclude '*.xcodeproj/' \
-  --exclude '.DS_Store' \
-  "$PROJECT_ROOT/" "$MAC_HOST:$REMOTE_DIR/"
+if [[ $DO_CLEAN -eq 1 ]]; then
+  echo "Cleaning derived data..."
+  rm -rf "$PROJECT_ROOT/build/DerivedData"
+  rm -rf /tmp/openclaw-qa-harness-derived
+  echo ""
+fi
 
-echo ""
+# Step 1: Generate Xcode project if needed
+if [[ ! -f "$PROJECT_ROOT/OpenClawQA.xcodeproj/project.pbxproj" ]] || \
+   [[ "$PROJECT_ROOT/generate-xcodeproj.rb" -nt "$PROJECT_ROOT/OpenClawQA.xcodeproj/project.pbxproj" ]]; then
+  echo "Generating Xcode project..."
+  cd "$PROJECT_ROOT" && ruby generate-xcodeproj.rb
+  echo ""
+fi
 
-# Step 2: Generate Xcode project on Mac
-echo "🔧 Generating Xcode project..."
-ssh $SSH_OPTS "$MAC_HOST" "cd $REMOTE_DIR && ruby generate-xcodeproj.rb"
-
-echo ""
-
-# Step 3: Build
-echo "🏗️  Building OpenClawQA..."
-ssh $SSH_OPTS "$MAC_HOST" "cd $REMOTE_DIR && xcodebuild \
-  -project OpenClawQA.xcodeproj \
+# Step 2: Build main app
+echo "Building OpenClawQA..."
+xcodebuild \
+  -project "$PROJECT_ROOT/OpenClawQA.xcodeproj" \
   -scheme OpenClawQA \
   -configuration Debug \
-  -derivedDataPath build/DerivedData \
+  -derivedDataPath "$PROJECT_ROOT/build/DerivedData" \
   CODE_SIGN_IDENTITY=- \
   CODE_SIGNING_REQUIRED=NO \
   CODE_SIGNING_ALLOWED=NO \
-  2>&1 | tail -30"
+  2>&1 | tail -20
 
 echo ""
-echo "✅ Build complete!"
-echo ""
 
-# Step 4: Show build artifact
-ssh $SSH_OPTS "$MAC_HOST" "ls -la $REMOTE_DIR/build/DerivedData/Build/Products/Debug/OpenClawQA.app/ 2>/dev/null || echo '(check build output above for errors)'"
+# Step 3: Build harness if requested
+if [[ $BUILD_HARNESS -eq 1 ]]; then
+  echo "Building OCQAHarness..."
+
+  # Generate harness xcodeproj if needed
+  if [[ ! -f "$PROJECT_ROOT/Harness/OCQAHarness.xcodeproj/project.pbxproj" ]] || \
+     [[ "$PROJECT_ROOT/Harness/generate-harness-xcodeproj.rb" -nt "$PROJECT_ROOT/Harness/OCQAHarness.xcodeproj/project.pbxproj" ]]; then
+    cd "$PROJECT_ROOT/Harness" && ruby generate-harness-xcodeproj.rb
+  fi
+
+  # Detect available simulator
+  SIM_NAME=$(xcrun simctl list devices available | grep -E 'iPhone.*(Booted|Shutdown)' | head -1 | sed 's/ (.*//' | xargs)
+  SIM_NAME=${SIM_NAME:-"iPhone 16 Pro"}
+  echo "  Target simulator: $SIM_NAME"
+
+  xcodebuild build-for-testing \
+    -project "$PROJECT_ROOT/Harness/OCQAHarness.xcodeproj" \
+    -scheme OCQAHarnessUITests \
+    -destination "platform=iOS Simulator,name=$SIM_NAME" \
+    -derivedDataPath "/tmp/openclaw-qa-harness-derived" \
+    2>&1 | tail -20
+
+  echo ""
+  echo "Harness built. Quick capture:"
+  echo "  ./scripts/quick-capture.sh explore com.elitepro.resilife --actions 25"
+  echo "  ./scripts/quick-capture.sh screenshot"
+  echo "  ./scripts/quick-capture.sh tree com.elitepro.resilife"
+fi
+
+echo ""
+APP_PATH="$PROJECT_ROOT/build/DerivedData/Build/Products/Debug/OpenClawQA.app"
+if [[ -d "$APP_PATH" ]]; then
+  echo "Build artifact: $APP_PATH"
+  echo "Run: open $APP_PATH"
+else
+  echo "(check build output above for errors)"
+fi

@@ -29,3 +29,10 @@ xcuserdata/
 *.swp
 *~
 .env
+
+# Capture artifacts (large media, not for git)
+captures/
+*.xcresult
+*.mov
+*.webm
+*.mp4
