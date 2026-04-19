@@ -16,10 +16,19 @@ final class OrchestratorService {
         var maxActions: Int = 25
         var timeoutSeconds: Int = 300
         var resolvedRuntime: String = "iOS 26.4"
+        /// Launch arguments forwarded to the target app (e.g. ["--uitesting"])
+        var appLaunchArgs: [String] = []
+        /// Environment variables forwarded to the target app (e.g. ["UI_TEST_ROLE": "resident"])
+        var appLaunchEnv: [String: String] = [:]
 
         static func from(project: QAProject) -> RunConfiguration {
-            // Future: read from project config / .openclaw.yml
-            return RunConfiguration()
+            var config = RunConfiguration()
+            // ResiLife: bypass auth with the same flags the EWAG test suite uses
+            if project.bundleId == "com.elitepro.resilife" {
+                config.appLaunchArgs = ["--uitesting"]
+                config.appLaunchEnv = ["UI_TEST_ROLE": "resident"]
+            }
+            return config
         }
     }
 
@@ -302,6 +311,8 @@ final class OrchestratorService {
                 projectId: project.id,
                 runId: runId,
                 artifactDir: logDir,
+                appLaunchArgs: config.appLaunchArgs,
+                appLaunchEnv: config.appLaunchEnv,
                 onProgress: { [weak self] progress in
                     Task { @MainActor in
                         onPhaseChange(.exploring,

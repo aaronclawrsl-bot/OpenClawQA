@@ -15,13 +15,27 @@ import XCTest
 class ExplorerTests: XCTestCase {
 
     var app: XCUIApplication!
-    var config: [String: String] = [:]
+    var config: [String: Any] = [:]
     /// Detected once at setUp; avoids hardcoded device dimensions
     private var screenBounds: CGRect = .zero
 
-    var targetBundleId: String { config["OCQA_BUNDLE_ID"] ?? ProcessInfo.processInfo.environment["OCQA_BUNDLE_ID"] ?? "" }
-    var maxActions: Int { Int(config["OCQA_MAX_ACTIONS"] ?? ProcessInfo.processInfo.environment["OCQA_MAX_ACTIONS"] ?? "200") ?? 200 }
-    var timeoutSeconds: Int { Int(config["OCQA_TIMEOUT_SECONDS"] ?? ProcessInfo.processInfo.environment["OCQA_TIMEOUT_SECONDS"] ?? "1800") ?? 1800 }
+    var targetBundleId: String { config["OCQA_BUNDLE_ID"] as? String ?? ProcessInfo.processInfo.environment["OCQA_BUNDLE_ID"] ?? "" }
+    var maxActions: Int { Int(config["OCQA_MAX_ACTIONS"] as? String ?? ProcessInfo.processInfo.environment["OCQA_MAX_ACTIONS"] ?? "200") ?? 200 }
+    var timeoutSeconds: Int { Int(config["OCQA_TIMEOUT_SECONDS"] as? String ?? ProcessInfo.processInfo.environment["OCQA_TIMEOUT_SECONDS"] ?? "1800") ?? 1800 }
+    /// Launch arguments to forward to the target app (e.g. ["--uitesting"])
+    var appLaunchArgs: [String] { config["OCQA_APP_LAUNCH_ARGS"] as? [String] ?? [] }
+    /// Environment variables to forward to the target app (e.g. ["UI_TEST_ROLE": "resident"])
+    var appLaunchEnv: [String: String] {
+        if let dict = config["OCQA_APP_LAUNCH_ENV"] as? [String: String] { return dict }
+        return [:]
+    }
+
+    /// Resolve a string key: config (as String) -> process environment -> fallback
+    private func resolve(_ key: String, fallback: String = "") -> String {
+        if let v = config[key] as? String { return v }
+        if let v = ProcessInfo.processInfo.environment[key], !v.isEmpty { return v }
+        return fallback
+    }
 
     private func loadConfig() {
         let paths = [
@@ -31,7 +45,7 @@ class ExplorerTests: XCTestCase {
         ]
         for path in paths where !path.isEmpty {
             if let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
-               let dict = try? JSONSerialization.jsonObject(with: data) as? [String: String] {
+               let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
                 config = dict
                 return
             }
@@ -65,11 +79,19 @@ class ExplorerTests: XCTestCase {
             return false
         }
 
-        app.activate()
-        let started = app.wait(for: .runningForeground, timeout: 10)
-        if !started {
+        // Launch with auth-bypass args if configured, otherwise just activate
+        if !appLaunchArgs.isEmpty || !appLaunchEnv.isEmpty {
+            app.launchArguments = appLaunchArgs
+            app.launchEnvironment = appLaunchEnv
             app.launch()
             _ = app.wait(for: .runningForeground, timeout: 10)
+        } else {
+            app.activate()
+            let started = app.wait(for: .runningForeground, timeout: 10)
+            if !started {
+                app.launch()
+                _ = app.wait(for: .runningForeground, timeout: 10)
+            }
         }
 
         // Detect actual screen dimensions from the running app
@@ -92,8 +114,9 @@ class ExplorerTests: XCTestCase {
     // MARK: - Tap Actions
 
     func testTapAtCoordinate() {
-        let env = config.merging(ProcessInfo.processInfo.environment) { a, _ in a }
-        guard let xStr = env["OCQA_TAP_X"], let yStr = env["OCQA_TAP_Y"],
+        let xStr = resolve("OCQA_TAP_X")
+        let yStr = resolve("OCQA_TAP_Y")
+        guard !xStr.isEmpty, !yStr.isEmpty,
               let x = Double(xStr), let y = Double(yStr) else {
             XCTFail("OCQA_TAP_X and OCQA_TAP_Y must be set")
             return
@@ -106,8 +129,8 @@ class ExplorerTests: XCTestCase {
     }
 
     func testTapById() {
-        let env = config.merging(ProcessInfo.processInfo.environment) { a, _ in a }
-        guard let identifier = env["OCQA_TAP_ID"], !identifier.isEmpty else {
+        let identifier = resolve("OCQA_TAP_ID")
+        guard !identifier.isEmpty else {
             XCTFail("OCQA_TAP_ID must be set")
             return
         }
@@ -138,7 +161,7 @@ class ExplorerTests: XCTestCase {
     // MARK: - Swipe Actions
 
     func testSwipe() {
-        let dir = config["OCQA_SWIPE_DIR"] ?? ProcessInfo.processInfo.environment["OCQA_SWIPE_DIR"] ?? "up"
+        let dir = resolve("OCQA_SWIPE_DIR", fallback: "up")
         switch dir {
         case "up":    app.swipeUp()
         case "down":  app.swipeDown()
@@ -153,12 +176,13 @@ class ExplorerTests: XCTestCase {
     // MARK: - Type Text
 
     func testTypeText() {
-        let env = config.merging(ProcessInfo.processInfo.environment) { a, _ in a }
-        guard let text = env["OCQA_TYPE_TEXT"] else {
+        let text = resolve("OCQA_TYPE_TEXT")
+        guard !text.isEmpty else {
             XCTFail("OCQA_TYPE_TEXT must be set")
             return
         }
-        if let identifier = env["OCQA_TYPE_ID"], !identifier.isEmpty {
+        let identifier = resolve("OCQA_TYPE_ID")
+        if !identifier.isEmpty {
             let field = app.textFields[identifier]
             if field.exists {
                 field.tap()
@@ -201,7 +225,7 @@ class ExplorerTests: XCTestCase {
     // MARK: - Screenshot
 
     func testScreenshot() {
-        let label = config["OCQA_SCREENSHOT_LABEL"] ?? ProcessInfo.processInfo.environment["OCQA_SCREENSHOT_LABEL"] ?? "screenshot"
+        let label = resolve("OCQA_SCREENSHOT_LABEL", fallback: "screenshot")
         let screenshot = app.screenshot()
         let attachment = XCTAttachment(screenshot: screenshot)
         attachment.name = label

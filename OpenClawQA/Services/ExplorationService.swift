@@ -91,6 +91,8 @@ final class ExplorationService {
         projectId: String,
         runId: String,
         artifactDir: String,
+        appLaunchArgs: [String] = [],
+        appLaunchEnv: [String: String] = [:],
         onProgress: @escaping (ExplorationProgress) -> Void
     ) async -> ExplorationResult {
         var findings: [QAFinding] = []
@@ -104,9 +106,19 @@ final class ExplorationService {
         var statesDiscovered = 0
 
         // Write config for harness
-        let configJson = """
-        {"OCQA_BUNDLE_ID":"\(bundleId)","OCQA_MAX_ACTIONS":"\(maxActions)","OCQA_TIMEOUT_SECONDS":"\(timeoutSeconds)"}
-        """
+        var configDict: [String: Any] = [
+            "OCQA_BUNDLE_ID": bundleId,
+            "OCQA_MAX_ACTIONS": "\(maxActions)",
+            "OCQA_TIMEOUT_SECONDS": "\(timeoutSeconds)"
+        ]
+        if !appLaunchArgs.isEmpty {
+            configDict["OCQA_APP_LAUNCH_ARGS"] = appLaunchArgs
+        }
+        if !appLaunchEnv.isEmpty {
+            configDict["OCQA_APP_LAUNCH_ENV"] = appLaunchEnv
+        }
+        let configData = (try? JSONSerialization.data(withJSONObject: configDict, options: [])) ?? Data()
+        let configJson = String(data: configData, encoding: .utf8) ?? "{}"
         let configPath = "/tmp/ocqa-run-config.json"
         try? configJson.write(toFile: configPath, atomically: true, encoding: .utf8)
 
