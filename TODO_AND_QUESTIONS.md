@@ -38,7 +38,7 @@
 
 ## Questions / Blockers
 
-1. **ResiLife branch state**: The iosApp repo is on branch `issue-95-auth-email-provider-strategy`, not `main`. Should QA runs target main or the current branch?
+1. **ResiLife branch state**: The iosApp repo is on branch `issue-95-auth-email-provider-strategy`, not `main`. Should QA runs target main or the current branch? - AARON'S ANSWER: always main
 2. **Test credentials**: Does ResiLife require login credentials for testing? If so, they need to be stored via KeychainService and passed to the test runner.
 3. **ResiLife test targets**: `ResiLifeTests` and `ResiLifeUITests` exist but may have limited test coverage. The current pipeline runs `xcodebuild test` against them — are they expected to pass?
 4. **Derived data isolation**: The orchestrator uses a temp derived data path. Should it share with the user's normal Xcode derived data?

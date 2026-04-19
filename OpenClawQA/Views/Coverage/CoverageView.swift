@@ -5,10 +5,39 @@ struct CoverageView: View {
     @State private var selectedCoverageTab: String = "Flow Map"
 
     var coverageNodes: [CoverageNode] {
+        // Use real exploration data if available
+        if !appState.coverageNodes.isEmpty {
+            return appState.coverageNodes
+        }
+
         guard let run = appState.latestRun, run.status == .completed else {
             return []
         }
-        // Build coverage nodes from actual run data
+        // Fallback: build coverage nodes from screen snapshots
+        let snapshots = appState.screenSnapshots
+        if !snapshots.isEmpty {
+            var uniqueScreens: [String: Int] = [:]
+            for s in snapshots {
+                let name = s.screenClassification ?? "Unknown"
+                uniqueScreens[name, default: 0] += 1
+            }
+            let sorted = uniqueScreens.keys.sorted()
+            let gridColumns = max(1, Int(ceil(sqrt(Double(sorted.count)))))
+            return sorted.enumerated().map { (i, name) in
+                let row = i / gridColumns
+                let col = i % gridColumns
+                return CoverageNode(
+                    id: "node-\(name.hashValue)",
+                    name: name,
+                    coveragePercent: 100,
+                    status: .visited,
+                    position: CGPoint(x: CGFloat(col) * 200 + 100, y: CGFloat(row) * 150 + 80),
+                    connections: []
+                )
+            }
+        }
+
+        // Final fallback: static layout when no exploration data exists
         var nodes: [CoverageNode] = []
         let coverage = run.coveragePercent
 

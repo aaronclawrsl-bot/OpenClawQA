@@ -8,6 +8,7 @@ final class OrchestratorService {
 
     private let runner = RunnerService.shared
     private let db = DatabaseManager.shared
+    private let explorer = ExplorationService.shared
 
     enum RunError: Error, LocalizedError {
         case buildFailed(String)
@@ -50,6 +51,10 @@ final class OrchestratorService {
         var findings: [QAFinding]
         var artifacts: [QAArtifact]
         var phaseEvents: [RunPhaseEvent]
+        var snapshots: [ScreenSnapshot]
+        var actionEvents: [ActionEvent]
+        var coverageNodes: [CoverageNode]
+        var screensVisited: [String]
     }
 
     // Execute a full release check against a real project
@@ -152,7 +157,8 @@ final class OrchestratorService {
                 resolvedRuntime: resolvedRuntime,
                 commitSha: commitSha, branch: branch,
                 buildLog: buildResult.log, findings: findings, artifacts: artifacts,
-                phaseEvents: phaseEvents
+                phaseEvents: phaseEvents,
+                snapshots: [], actionEvents: [], coverageNodes: [], screensVisited: []
             )
         }
 
@@ -232,12 +238,16 @@ final class OrchestratorService {
 
         recordPhase(.deterministicChecks, substep: "Launch check completed", status: "completed")
 
-        // ===== 6. RUN TESTS =====
-        onPhaseChange(.exploring, "Running tests...")
+        // ===== 6. RUN TESTS + AUTONOMOUS EXPLORATION =====
+        onPhaseChange(.exploring, "Running deterministic tests...")
         recordPhase(.exploring, substep: "Running xcodebuild test")
 
         var testsPassed = 0
         var testsFailed = 0
+        var explorationSnapshots: [ScreenSnapshot] = []
+        var explorationActions: [ActionEvent] = []
+        var explorationCoverageNodes: [CoverageNode] = []
+        var screensVisited: [String] = []
 
         if let projectPath = project.projectPath, !projectPath.isEmpty {
             let testResult = await runner.runTests(
@@ -264,7 +274,69 @@ final class OrchestratorService {
             findings.append(contentsOf: testFindings)
         }
 
-        recordPhase(.exploring, substep: "Tests completed", status: "completed")
+        recordPhase(.exploring, substep: "Deterministic tests completed", status: "completed")
+
+        // ===== 6b. AUTONOMOUS EXPLORATION =====
+        onPhaseChange(.exploring, "Building exploration harness...")
+        recordPhase(.exploring, substep: "Building exploration harness")
+
+        let harnessBuild = await explorer.ensureHarnessBuilt(simulator: simulatorName)
+        if harnessBuild.success {
+            recordPhase(.exploring, substep: "Harness built", status: "completed")
+
+            onPhaseChange(.exploring, "Exploring app autonomously...")
+            recordPhase(.exploring, substep: "Autonomous exploration started")
+
+            let explorationResult = await explorer.runExploration(
+                bundleId: project.bundleId,
+                simulator: simulatorName,
+                simulatorUDID: simulatorUDID,
+                maxActions: 200,
+                timeoutSeconds: 1800,
+                projectId: project.id,
+                runId: runId,
+                artifactDir: logDir,
+                onProgress: { [weak self] progress in
+                    Task { @MainActor in
+                        onPhaseChange(.exploring,
+                            "Exploring: \(progress.action)/\(progress.maxActions) actions, \(progress.statesDiscovered) screens — \(progress.currentScreen)")
+                    }
+                }
+            )
+
+            findings.append(contentsOf: explorationResult.findings)
+            explorationSnapshots = explorationResult.snapshots
+            explorationActions = explorationResult.actionEvents
+            explorationCoverageNodes = explorationResult.coverageNodes
+            screensVisited = explorationResult.screensVisited
+
+            // Save exploration log as artifact
+            let explorationLogPath = logDir + "/exploration.log"
+            if FileManager.default.fileExists(atPath: explorationLogPath) {
+                artifacts.append(QAArtifact(
+                    id: UUID().uuidString, runId: runId, type: "exploration_log",
+                    path: explorationLogPath,
+                    metadata: "{\"actions\": \(explorationResult.actionsPerformed), \"states\": \(explorationResult.statesDiscovered), \"issues\": \(explorationResult.findings.count)}",
+                    createdAt: Date()
+                ))
+            }
+
+            // Save xcresult as artifact
+            if let xcresultPath = explorationResult.xcresultPath {
+                artifacts.append(QAArtifact(
+                    id: UUID().uuidString, runId: runId, type: "xcresult",
+                    path: xcresultPath,
+                    metadata: "{\"source\": \"exploration\"}",
+                    createdAt: Date()
+                ))
+            }
+
+            recordPhase(.exploring, substep: "Exploration complete: \(explorationResult.actionsPerformed) actions, \(explorationResult.statesDiscovered) screens, \(explorationResult.findings.count) issues", status: "completed")
+        } else {
+            recordPhase(.exploring, substep: "Harness build failed — skipping exploration", status: "failed")
+            let harnessLogPath = logDir + "/harness-build.log"
+            try? harnessBuild.log.write(toFile: harnessLogPath, atomically: true, encoding: .utf8)
+        }
 
         // ===== 7. ANALYZING =====
         onPhaseChange(.analyzing, "Classifying findings...")
@@ -317,6 +389,17 @@ final class OrchestratorService {
             readiness = .ready
         }
 
+        let flowsExplored = max(screensVisited.count, totalTests > 0 ? max(1, totalTests / 5) : 0)
+        let coveragePercent: Double
+        if !screensVisited.isEmpty {
+            // Estimate coverage based on screens visited vs expected
+            coveragePercent = min(100, Double(screensVisited.count) / 15.0 * 100)
+        } else if totalTests > 0 {
+            coveragePercent = min(100, Double(testsPassed) / Double(max(1, totalTests)) * 100)
+        } else {
+            coveragePercent = 0
+        }
+
         recordPhase(.summarizing, substep: "Report generated", status: "completed")
         onPhaseChange(.completed, "Run complete")
         recordPhase(.completed, substep: "Run completed", status: "completed")
@@ -326,13 +409,18 @@ final class OrchestratorService {
             releaseReadiness: readiness, confidenceScore: confidenceScore,
             criticalFindings: criticalCount, highFindings: highCount,
             mediumFindings: mediumCount, lowFindings: lowCount,
-            testsExecuted: totalTests, flowsExplored: totalTests > 0 ? max(1, totalTests / 5) : 1,
-            coveragePercent: totalTests > 0 ? min(100, Double(testsPassed) / Double(max(1, totalTests)) * 100) : 0,
+            testsExecuted: totalTests + explorationActions.count,
+            flowsExplored: flowsExplored,
+            coveragePercent: coveragePercent,
             xcodeVersion: xcodeVersion, simulatorProfile: simulatorProfile,
             resolvedRuntime: resolvedRuntime,
             commitSha: commitSha, branch: branch,
             buildLog: buildResult.log, findings: findings, artifacts: artifacts,
-            phaseEvents: phaseEvents
+            phaseEvents: phaseEvents,
+            snapshots: explorationSnapshots,
+            actionEvents: explorationActions,
+            coverageNodes: explorationCoverageNodes,
+            screensVisited: screensVisited
         )
     }
 

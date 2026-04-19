@@ -42,6 +42,9 @@ final class AppState: ObservableObject {
     @Published var integrations: [IntegrationConnection] = []
     @Published var artifacts: [QAArtifact] = []
     @Published var runPhaseEvents: [RunPhaseEvent] = []
+    @Published var screenSnapshots: [ScreenSnapshot] = []
+    @Published var actionEvents: [ActionEvent] = []
+    @Published var coverageNodes: [CoverageNode] = []
 
     var latestRun: QARun? { runs.first }
 
@@ -112,6 +115,8 @@ final class AppState: ObservableObject {
         showRunDetail = true
         artifacts = db.fetchArtifacts(runId: id)
         runPhaseEvents = db.fetchRunPhaseEvents(runId: id)
+        screenSnapshots = db.fetchScreenSnapshots(runId: id)
+        actionEvents = db.fetchActionEvents(runId: id)
     }
 
     func selectFinding(_ id: String) {
@@ -197,11 +202,22 @@ final class AppState: ObservableObject {
                     db.insertArtifact(artifact)
                 }
 
+                // Insert exploration data
+                for snapshot in result.snapshots {
+                    db.insertScreenSnapshot(snapshot)
+                }
+                for actionEvent in result.actionEvents {
+                    db.insertActionEvent(actionEvent)
+                }
+
                 await MainActor.run {
                     if let index = self.runs.firstIndex(where: { $0.id == runId }) {
                         self.runs[index] = run
                     }
                     self.findings = self.db.fetchFindings(projectId: project.id)
+                    self.screenSnapshots = result.snapshots
+                    self.actionEvents = result.actionEvents
+                    self.coverageNodes = result.coverageNodes
                     self.isRunning = false
                     self.currentPhaseDetail = "Run complete"
                 }

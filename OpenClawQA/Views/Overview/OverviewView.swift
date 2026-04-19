@@ -168,24 +168,58 @@ struct OverviewView: View {
             // Screenshot gallery
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: AppSpacing.md) {
-                    ForEach(demoScreenshots, id: \.0) { screen in
-                        VStack(spacing: AppSpacing.xs) {
-                            RoundedRectangle(cornerRadius: 8)
-                                .fill(AppColors.inputBackground)
-                                .frame(width: 120, height: 220)
-                                .overlay(
-                                    VStack(spacing: 4) {
-                                        Image(systemName: "iphone")
-                                            .font(.system(size: 24))
-                                            .foregroundColor(AppColors.textTertiary)
-                                        Text(screen.1)
-                                            .font(AppFont.caption(10))
-                                            .foregroundColor(AppColors.textTertiary)
-                                    }
-                                )
-                            Text(screen.2)
-                                .font(AppFont.mono(10))
-                                .foregroundColor(AppColors.textTertiary)
+                    let screenshots = explorationScreenshots
+                    if screenshots.isEmpty {
+                        ForEach(demoScreenshots, id: \.0) { screen in
+                            VStack(spacing: AppSpacing.xs) {
+                                RoundedRectangle(cornerRadius: 8)
+                                    .fill(AppColors.inputBackground)
+                                    .frame(width: 120, height: 220)
+                                    .overlay(
+                                        VStack(spacing: 4) {
+                                            Image(systemName: "iphone")
+                                                .font(.system(size: 24))
+                                                .foregroundColor(AppColors.textTertiary)
+                                            Text(screen.1)
+                                                .font(AppFont.caption(10))
+                                                .foregroundColor(AppColors.textTertiary)
+                                        }
+                                    )
+                                Text(screen.2)
+                                    .font(AppFont.mono(10))
+                                    .foregroundColor(AppColors.textTertiary)
+                            }
+                        }
+                    } else {
+                        ForEach(screenshots, id: \.id) { snapshot in
+                            VStack(spacing: AppSpacing.xs) {
+                                if let path = snapshot.screenshotPath,
+                                   let nsImage = NSImage(contentsOfFile: path) {
+                                    Image(nsImage: nsImage)
+                                        .resizable()
+                                        .aspectRatio(contentMode: .fit)
+                                        .frame(width: 120, height: 220)
+                                        .cornerRadius(8)
+                                } else {
+                                    RoundedRectangle(cornerRadius: 8)
+                                        .fill(AppColors.inputBackground)
+                                        .frame(width: 120, height: 220)
+                                        .overlay(
+                                            VStack(spacing: 4) {
+                                                Image(systemName: "iphone")
+                                                    .font(.system(size: 24))
+                                                    .foregroundColor(AppColors.textTertiary)
+                                                Text(snapshot.screenClassification ?? "Screen")
+                                                    .font(AppFont.caption(10))
+                                                    .foregroundColor(AppColors.textTertiary)
+                                            }
+                                        )
+                                }
+                                Text(snapshot.screenClassification ?? "Step \(snapshot.stepIndex)")
+                                    .font(AppFont.mono(10))
+                                    .foregroundColor(AppColors.textTertiary)
+                                    .lineLimit(1)
+                            }
                         }
                     }
                 }
@@ -202,6 +236,22 @@ struct OverviewView: View {
         return (0..<explored).map { i in
             ("\(i+1)", screens[i], String(format: "%02d:%02d", i * 5, i * 7))
         }
+    }
+
+    // Real screenshots from exploration, deduplicated by screen name (one per unique screen)
+    private var explorationScreenshots: [ScreenSnapshot] {
+        let snapshots = appState.screenSnapshots
+        guard !snapshots.isEmpty else { return [] }
+        var seen = Set<String>()
+        var result: [ScreenSnapshot] = []
+        for s in snapshots {
+            let key = s.screenClassification ?? s.screenFingerprint
+            if !seen.contains(key) {
+                seen.insert(key)
+                result.append(s)
+            }
+        }
+        return result
     }
 
     // MARK: - Coverage

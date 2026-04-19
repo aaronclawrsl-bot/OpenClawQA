@@ -149,23 +149,33 @@ struct RunDetailView: View {
     // MARK: - Video Player
     private var videoPlayerArea: some View {
         VStack(spacing: 0) {
-            // Video frame
-            RoundedRectangle(cornerRadius: 12)
-                .fill(AppColors.inputBackground)
-                .frame(height: 300)
-                .overlay(
-                    VStack(spacing: AppSpacing.md) {
-                        Image(systemName: "iphone.gen3")
-                            .font(.system(size: 48))
-                            .foregroundColor(AppColors.textTertiary)
-                        Text("Video replay")
-                            .font(AppFont.caption())
-                            .foregroundColor(AppColors.textTertiary)
-                        Text("Screenshots and recordings from this run will appear here")
-                            .font(AppFont.caption())
-                            .foregroundColor(AppColors.textTertiary)
-                    }
-                )
+            // Screenshot/video frame
+            if let snapshot = appState.screenSnapshots.last(where: { $0.screenshotPath != nil }),
+               let path = snapshot.screenshotPath,
+               let nsImage = NSImage(contentsOfFile: path) {
+                Image(nsImage: nsImage)
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .frame(maxHeight: 300)
+                    .cornerRadius(12)
+            } else {
+                RoundedRectangle(cornerRadius: 12)
+                    .fill(AppColors.inputBackground)
+                    .frame(height: 300)
+                    .overlay(
+                        VStack(spacing: AppSpacing.md) {
+                            Image(systemName: "iphone.gen3")
+                                .font(.system(size: 48))
+                                .foregroundColor(AppColors.textTertiary)
+                            Text("Video replay")
+                                .font(AppFont.caption())
+                                .foregroundColor(AppColors.textTertiary)
+                            Text("Screenshots and recordings from this run will appear here")
+                                .font(AppFont.caption())
+                                .foregroundColor(AppColors.textTertiary)
+                        }
+                    )
+            }
 
             // Playback controls
             HStack {
@@ -292,12 +302,55 @@ struct RunDetailView: View {
     // MARK: - Timeline Content
     private var timelineContent: some View {
         VStack(alignment: .leading, spacing: AppSpacing.md) {
+            // Show exploration action events if available
+            let actions = appState.actionEvents
+            if !actions.isEmpty {
+                Text("Exploration Timeline (\(actions.count) actions)")
+                    .font(AppFont.subheading())
+                    .foregroundColor(AppColors.textPrimary)
+                    .padding(.bottom, AppSpacing.xs)
+
+                ForEach(actions, id: \.id) { action in
+                    HStack(spacing: AppSpacing.md) {
+                        Image(systemName: actionIcon(action.actionType))
+                            .foregroundColor(action.result == "success" ? AppColors.success : AppColors.error)
+                            .font(.system(size: 14))
+                            .frame(width: 20)
+                        VStack(alignment: .leading, spacing: 2) {
+                            HStack(spacing: 4) {
+                                Text("Step \(action.stepIndex)")
+                                    .font(AppFont.mono(11))
+                                    .foregroundColor(AppColors.textTertiary)
+                                Text(action.actionType.capitalized)
+                                    .font(AppFont.subheading())
+                                    .foregroundColor(AppColors.textPrimary)
+                            }
+                            if let target = action.targetDescriptor, !target.isEmpty {
+                                Text(target)
+                                    .font(AppFont.caption())
+                                    .foregroundColor(AppColors.textSecondary)
+                                    .lineLimit(2)
+                            }
+                        }
+                        Spacer()
+                        Text(action.timestamp.formatted(date: .omitted, time: .standard))
+                            .font(AppFont.mono(10))
+                            .foregroundColor(AppColors.textTertiary)
+                    }
+                    .padding(.vertical, 2)
+                }
+            }
+
+            // Also show phase events
             let events = appState.runPhaseEvents
-            if events.isEmpty {
-                Text("No timeline data available")
-                    .font(AppFont.caption())
-                    .foregroundColor(AppColors.textTertiary)
-            } else {
+            if !events.isEmpty {
+                if !actions.isEmpty {
+                    Divider().background(AppColors.border).padding(.vertical, AppSpacing.sm)
+                    Text("Phase Events")
+                        .font(AppFont.subheading())
+                        .foregroundColor(AppColors.textPrimary)
+                        .padding(.bottom, AppSpacing.xs)
+                }
                 ForEach(events, id: \.id) { event in
                     HStack(spacing: AppSpacing.md) {
                         Image(systemName: event.status == "completed" ? "checkmark.circle.fill" : (event.status == "failed" ? "xmark.circle.fill" : "circle"))
@@ -315,8 +368,25 @@ struct RunDetailView: View {
                     }
                 }
             }
+
+            if actions.isEmpty && events.isEmpty {
+                Text("No timeline data available")
+                    .font(AppFont.caption())
+                    .foregroundColor(AppColors.textTertiary)
+            }
         }
         .cardStyle()
+    }
+
+    private func actionIcon(_ type: String) -> String {
+        switch type.lowercased() {
+        case "tap": return "hand.tap"
+        case "type", "text": return "keyboard"
+        case "scroll", "swipe": return "hand.draw"
+        case "back": return "arrow.left"
+        case "screenshot": return "camera"
+        default: return "circle.fill"
+        }
     }
 
     // MARK: - Environment Content

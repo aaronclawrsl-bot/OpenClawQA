@@ -411,6 +411,98 @@ final class DatabaseManager {
         return items
     }
 
+    // MARK: - Screen Snapshots CRUD
+    func insertScreenSnapshot(_ s: ScreenSnapshot) {
+        let sql = """
+            INSERT INTO screen_snapshots (id, run_id, step_index, timestamp, screen_fingerprint,
+            screenshot_path, accessibility_tree_json, screen_classification, parent_snapshot_id)
+            VALUES (?,?,?,?,?,?,?,?,?)
+        """
+        var stmt: OpaquePointer?
+        if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK {
+            bindText(stmt, 1, s.id); bindText(stmt, 2, s.runId)
+            sqlite3_bind_int(stmt, 3, Int32(s.stepIndex))
+            bindText(stmt, 4, dateStr(s.timestamp))
+            bindText(stmt, 5, s.screenFingerprint)
+            bindText(stmt, 6, s.screenshotPath)
+            bindText(stmt, 7, s.accessibilityTreeJson)
+            bindText(stmt, 8, s.screenClassification)
+            bindText(stmt, 9, s.parentSnapshotId)
+            sqlite3_step(stmt)
+        }
+        sqlite3_finalize(stmt)
+    }
+
+    func fetchScreenSnapshots(runId: String) -> [ScreenSnapshot] {
+        var items: [ScreenSnapshot] = []
+        var stmt: OpaquePointer?
+        let sql = "SELECT * FROM screen_snapshots WHERE run_id = ? ORDER BY step_index"
+        if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK {
+            bindText(stmt, 1, runId)
+            while sqlite3_step(stmt) == SQLITE_ROW {
+                items.append(ScreenSnapshot(
+                    id: colText(stmt!, 0), runId: colText(stmt!, 1),
+                    stepIndex: colInt(stmt!, 2),
+                    timestamp: parseDate(colText(stmt!, 3)),
+                    screenFingerprint: colText(stmt!, 4),
+                    screenshotPath: colOptText(stmt!, 5),
+                    accessibilityTreeJson: colOptText(stmt!, 6),
+                    screenClassification: colOptText(stmt!, 7),
+                    parentSnapshotId: colOptText(stmt!, 8)
+                ))
+            }
+        }
+        sqlite3_finalize(stmt)
+        return items
+    }
+
+    // MARK: - Action Events CRUD
+    func insertActionEvent(_ e: ActionEvent) {
+        let sql = """
+            INSERT INTO action_events (id, run_id, step_index, source_snapshot_id, action_type,
+            target_descriptor, result, timestamp, duration_ms, produced_snapshot_id)
+            VALUES (?,?,?,?,?,?,?,?,?,?)
+        """
+        var stmt: OpaquePointer?
+        if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK {
+            bindText(stmt, 1, e.id); bindText(stmt, 2, e.runId)
+            sqlite3_bind_int(stmt, 3, Int32(e.stepIndex))
+            bindText(stmt, 4, e.sourceSnapshotId)
+            bindText(stmt, 5, e.actionType)
+            bindText(stmt, 6, e.targetDescriptor)
+            bindText(stmt, 7, e.result)
+            bindText(stmt, 8, dateStr(e.timestamp))
+            if let d = e.durationMs { sqlite3_bind_int(stmt, 9, Int32(d)) } else { sqlite3_bind_null(stmt, 9) }
+            bindText(stmt, 10, e.producedSnapshotId)
+            sqlite3_step(stmt)
+        }
+        sqlite3_finalize(stmt)
+    }
+
+    func fetchActionEvents(runId: String) -> [ActionEvent] {
+        var items: [ActionEvent] = []
+        var stmt: OpaquePointer?
+        let sql = "SELECT * FROM action_events WHERE run_id = ? ORDER BY step_index"
+        if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK {
+            bindText(stmt, 1, runId)
+            while sqlite3_step(stmt) == SQLITE_ROW {
+                items.append(ActionEvent(
+                    id: colText(stmt!, 0), runId: colText(stmt!, 1),
+                    stepIndex: colInt(stmt!, 2),
+                    sourceSnapshotId: colOptText(stmt!, 3),
+                    actionType: colText(stmt!, 4),
+                    targetDescriptor: colOptText(stmt!, 5),
+                    result: colText(stmt!, 6),
+                    timestamp: parseDate(colText(stmt!, 7)),
+                    durationMs: colOptInt(stmt!, 8),
+                    producedSnapshotId: colOptText(stmt!, 9)
+                ))
+            }
+        }
+        sqlite3_finalize(stmt)
+        return items
+    }
+
     // MARK: - Helpers
     private func bindText(_ stmt: OpaquePointer?, _ index: Int32, _ value: String?) {
         if let value = value {
