@@ -648,7 +648,7 @@ final class DatabaseManager {
     }
 
     // MARK: - Update Run (full)
-    func updateRun(_ r: QARun) {
+    func updateRun(_ r: QARun) { synchronized {
         let sql = """
             UPDATE runs SET status = ?, phase = ?, runner_id = ?, xcode_version = ?,
             simulator_profile = ?, resolved_runtime = ?, started_at = ?, ended_at = ?,
@@ -683,10 +683,10 @@ final class DatabaseManager {
             sqlite3_step(stmt)
         }
         sqlite3_finalize(stmt)
-    }
+    } }
 
     // MARK: - Artifacts CRUD
-    func insertArtifact(_ a: QAArtifact) {
+    func insertArtifact(_ a: QAArtifact) { synchronized {
         let sql = "INSERT INTO artifacts (id, run_id, type, path, metadata, created_at) VALUES (?,?,?,?,?,?)"
         var stmt: OpaquePointer?
         if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK {
@@ -696,9 +696,9 @@ final class DatabaseManager {
             sqlite3_step(stmt)
         }
         sqlite3_finalize(stmt)
-    }
+    } }
 
-    func fetchArtifacts(runId: String) -> [QAArtifact] {
+    func fetchArtifacts(runId: String) -> [QAArtifact] { synchronized {
         var items: [QAArtifact] = []
         var stmt: OpaquePointer?
         let sql = "SELECT * FROM artifacts WHERE run_id = ? ORDER BY created_at"
@@ -714,10 +714,10 @@ final class DatabaseManager {
         }
         sqlite3_finalize(stmt)
         return items
-    }
+    } }
 
     // MARK: - Run Phase Events CRUD
-    func insertRunPhaseEvent(_ e: RunPhaseEvent) {
+    func insertRunPhaseEvent(_ e: RunPhaseEvent) { synchronized {
         let sql = "INSERT INTO run_phase_events (id, run_id, phase, substep, status, timestamp, payload) VALUES (?,?,?,?,?,?,?)"
         var stmt: OpaquePointer?
         if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK {
@@ -728,9 +728,9 @@ final class DatabaseManager {
             sqlite3_step(stmt)
         }
         sqlite3_finalize(stmt)
-    }
+    } }
 
-    func fetchRunPhaseEvents(runId: String) -> [RunPhaseEvent] {
+    func fetchRunPhaseEvents(runId: String) -> [RunPhaseEvent] { synchronized {
         var items: [RunPhaseEvent] = []
         var stmt: OpaquePointer?
         let sql = "SELECT * FROM run_phase_events WHERE run_id = ? ORDER BY timestamp"
@@ -747,15 +747,15 @@ final class DatabaseManager {
         }
         sqlite3_finalize(stmt)
         return items
-    }
+    } }
 
     // MARK: - Delete All Data (for reset)
-    func deleteAllData() {
+    func deleteAllData() { synchronized {
         execute("DELETE FROM findings")
         execute("DELETE FROM run_phase_events")
         execute("DELETE FROM artifacts")
         execute("DELETE FROM runs")
         execute("DELETE FROM integration_connections")
         execute("DELETE FROM projects")
-    }
+    } }
 }

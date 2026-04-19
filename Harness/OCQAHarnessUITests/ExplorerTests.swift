@@ -272,6 +272,79 @@ class ExplorerTests: XCTestCase {
 
         print("OCQA_STATE:exploration_started max_actions=\(maxActions)")
 
+        // --- Login preamble: if credentials are provided and login fields are visible, log in first ---
+        let testEmail = resolve("OCQA_TEST_EMAIL")
+        let testPassword = resolve("OCQA_TEST_PASSWORD")
+        if !testEmail.isEmpty, !testPassword.isEmpty {
+            Thread.sleep(forTimeInterval: 1.0) // let app fully settle
+            let allTextFields = app.textFields.allElementsBoundByIndex.filter { $0.exists && $0.frame.width > 0 }
+            let allSecureFields = app.secureTextFields.allElementsBoundByIndex.filter { $0.exists && $0.frame.width > 0 }
+            print("OCQA_STATE:login_preamble_fields textFields=\(allTextFields.count) secureFields=\(allSecureFields.count)")
+
+            let emailField = allTextFields.first { f in
+                let hint = (f.identifier + " " + (f.placeholderValue ?? "") + " " + f.label).lowercased()
+                return hint.contains("email") || hint.contains("e-mail")
+            } ?? (allSecureFields.count > 0 ? allTextFields.first : nil)
+
+            let passwordField = allSecureFields.first
+                ?? allTextFields.first { f in
+                    let hint = (f.identifier + " " + (f.placeholderValue ?? "") + " " + f.label).lowercased()
+                    return hint.contains("password") || hint.contains("passcode")
+                }
+
+            if let emailF = emailField, emailF.exists, let passF = passwordField, passF.exists {
+                print("OCQA_STATE:login_preamble_attempting")
+                emailF.tap()
+                Thread.sleep(forTimeInterval: 0.3)
+                emailF.typeText(testEmail)
+                Thread.sleep(forTimeInterval: 0.3)
+
+                passF.tap()
+                Thread.sleep(forTimeInterval: 0.3)
+                passF.typeText(testPassword)
+                Thread.sleep(forTimeInterval: 0.3)
+
+                // Dismiss keyboard
+                let keyboard = app.keyboards.firstMatch
+                if keyboard.exists {
+                    let aboveKeyboard = app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.3))
+                    aboveKeyboard.tap()
+                    Thread.sleep(forTimeInterval: 0.3)
+                }
+
+                // Find and tap login/sign-in button
+                let loginLabels = ["Log In", "Login", "Sign In", "Sign in", "log in", "LOG IN", "SIGN IN"]
+                var tappedLogin = false
+                for label in loginLabels {
+                    let btn = app.buttons[label]
+                    if btn.exists && btn.isHittable {
+                        btn.tap()
+                        tappedLogin = true
+                        break
+                    }
+                    let st = app.staticTexts[label]
+                    if st.exists && st.isHittable {
+                        st.tap()
+                        tappedLogin = true
+                        break
+                    }
+                }
+                if tappedLogin {
+                    print("OCQA_STATE:login_preamble_submitted")
+                    Thread.sleep(forTimeInterval: 3.0)
+                    var lastC = 0
+                    for _ in 0..<5 {
+                        Thread.sleep(forTimeInterval: 0.5)
+                        let c = app.descendants(matching: .any).count
+                        if c > 10 && c == lastC { break }
+                        lastC = c
+                    }
+                } else {
+                    print("OCQA_STATE:login_preamble_no_submit_button")
+                }
+            }
+        }
+
         // Trigger the interruption monitor on any pending system alerts
         app.tap()
         Thread.sleep(forTimeInterval: 0.3)
@@ -632,9 +705,9 @@ class ExplorerTests: XCTestCase {
             let hint = (element.identifier + " " + element.label).lowercased()
             let testText: String
             if hint.contains("email") || hint.contains("e-mail") {
-                testText = "test@example.com"
+                testText = resolve("OCQA_TEST_EMAIL", fallback: "test@example.com")
             } else if hint.contains("password") || hint.contains("passcode") {
-                testText = "TestPass123!"
+                testText = resolve("OCQA_TEST_PASSWORD", fallback: "TestPass123!")
             } else if hint.contains("phone") || hint.contains("mobile") {
                 testText = "5551234567"
             } else if hint.contains("name") || hint.contains("first") || hint.contains("last") {

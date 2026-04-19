@@ -93,6 +93,8 @@ final class ExplorationService {
         artifactDir: String,
         appLaunchArgs: [String] = [],
         appLaunchEnv: [String: String] = [:],
+        testEmail: String = "",
+        testPassword: String = "",
         onProgress: @escaping (ExplorationProgress) -> Void
     ) async -> ExplorationResult {
         var findings: [QAFinding] = []
@@ -116,6 +118,12 @@ final class ExplorationService {
         }
         if !appLaunchEnv.isEmpty {
             configDict["OCQA_APP_LAUNCH_ENV"] = appLaunchEnv
+        }
+        if !testEmail.isEmpty {
+            configDict["OCQA_TEST_EMAIL"] = testEmail
+        }
+        if !testPassword.isEmpty {
+            configDict["OCQA_TEST_PASSWORD"] = testPassword
         }
         let configData = (try? JSONSerialization.data(withJSONObject: configDict, options: [])) ?? Data()
         let configJson = String(data: configData, encoding: .utf8) ?? "{}"

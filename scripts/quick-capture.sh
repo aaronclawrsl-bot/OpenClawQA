@@ -73,7 +73,9 @@ run_harness_test() {
 {
   "OCQA_BUNDLE_ID": "$bundle_id",
   "OCQA_MAX_ACTIONS": "$max_actions",
-  "OCQA_TIMEOUT_SECONDS": "$timeout_secs"
+  "OCQA_TIMEOUT_SECONDS": "$timeout_secs",
+  "OCQA_TEST_EMAIL": "${OCQA_TEST_EMAIL:-demo@eliteproai.com}",
+  "OCQA_TEST_PASSWORD": "${OCQA_TEST_PASSWORD:-Demo1234!}"
 }
 CONF
 

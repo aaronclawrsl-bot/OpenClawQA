@@ -61,24 +61,20 @@
 - The OCQAHarness xcodeproj uses automatic signing with `DEVELOPMENT_TEAM = ""`. If Xcode prompts for a team, select Aaron's Apple Developer account.
 - For physical device testing (not just simulator), a provisioning profile is needed.
 
-### 4. GitHub Credentials on Mac
-- Git push from Mac fails due to missing GitHub credentials or repo permission. The current safe workflow is still: Mac commits locally, Linux fetches and pushes.
-- **Fix**: Either add a GitHub PAT to the Mac's keychain, or continue the current workflow (push from Linux only, Mac pulls).
-
-### 5. Integration OAuth Setup
+### 4. Integration OAuth Setup
 - GitHub, Jira, Slack integration cards are UI stubs. To wire them:
   - **GitHub**: Create an OAuth App or use a PAT. Store in KeychainService.
   - **Jira**: Create API token at id.atlassian.com.
   - **Slack**: Create a Slack app with incoming webhook.
 - This is blocked on Aaron deciding which integrations are priority.
 
-### 6. Video Capture Pipeline Decision
+### 5. Video Capture Pipeline Decision
 - Choose between:
   - (A) OpenClawQA local workflow: `simctl`, `.xcresult`, `quick-capture.sh`, local artifacts
   - (B) Gateway workflow: `ewag-capture.sh`, `ios-agent`, Google Drive upload
 - The open question is no longer how to record video; it is whether Drive upload/export belongs inside OpenClawQA itself or should remain outside the app as a gateway responsibility.
 
-### 7. Google Drive Upload for Artifacts
+### 6. Google Drive Upload for Artifacts
 - ewag-capture.sh already handles Google Drive upload. To reuse for OpenClawQA artifacts:
   - Verify `~/.openclaw/credentials/google_client_secret.json` is configured
   - The upload function can be called post-exploration to push screenshots/videos to Drive

@@ -20,6 +20,10 @@ final class OrchestratorService {
         var appLaunchArgs: [String] = []
         /// Environment variables forwarded to the target app (e.g. ["UI_TEST_ROLE": "resident"])
         var appLaunchEnv: [String: String] = [:]
+        /// Test email for login preamble fallback (used when launch args don't skip auth)
+        var testEmail: String = ""
+        /// Test password for login preamble fallback
+        var testPassword: String = ""
 
         static func from(project: QAProject) -> RunConfiguration {
             var config = RunConfiguration()
@@ -27,6 +31,9 @@ final class OrchestratorService {
             if project.bundleId == "com.elitepro.resilife" {
                 config.appLaunchArgs = ["--uitesting"]
                 config.appLaunchEnv = ["UI_TEST_ROLE": "resident"]
+                // Fallback credentials if auth bypass doesn't take effect
+                config.testEmail = "demo@eliteproai.com"
+                config.testPassword = "Demo1234!"
             }
             return config
         }
@@ -313,6 +320,8 @@ final class OrchestratorService {
                 artifactDir: logDir,
                 appLaunchArgs: config.appLaunchArgs,
                 appLaunchEnv: config.appLaunchEnv,
+                testEmail: config.testEmail,
+                testPassword: config.testPassword,
                 onProgress: { [weak self] progress in
                     Task { @MainActor in
                         onPhaseChange(.exploring,
