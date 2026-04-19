@@ -1,4 +1,4 @@
-# IOS_TESTING_PRODUCT_DESIGN.md
+# IOS_QA_PRODUCT_DEV_INSTRUCTIONS.md
 
 ## Purpose
 
@@ -9,6 +9,112 @@ The product name used internally in this document is **OpenClaw QA**, but the co
 This product is a **macOS desktop QA control plane** for iOS apps. It connects to source repositories and selected external systems, builds customer apps, runs autonomous validation on iOS simulators and optionally real devices, captures artifacts, classifies failures, and pushes findings back into engineering workflows.
 
 The initial product is **macOS desktop first**, not browser first.
+
+---
+
+## Implementation Status — READ THIS FIRST
+
+> **Last updated: 2026-04-19**
+>
+> This section documents exactly what has been built, what works, what was learned, and what remains.
+> An agent inheriting this project must read this section thoroughly before touching any code.
+
+### Repository & Git
+
+- **Repo**: `aaronclawrsl-bot/OpenClawQA` on GitHub (private)
+- **Local (Linux build server)**: `/home/aaron/repos/OpenClawQA`
+- **Local (Mac runner)**: `~/repos/OpenClawQA` on `taylorolsen-vogt@100.125.133.123` (Tailscale IP)
+- **Branch**: `main` (only branch)
+- **Commits** (oldest → newest):
+  1. `0d1d624` — SwiftUI desktop app: full UI, 11 views, SQLite DB, models, services
+  2. `afd41a7` — Remove all mock data, wire real xcodebuild/simctl backend pipeline
+  3. `c71fbb1` — Wire autonomous exploration harness into the full orchestration pipeline
+  4. `07af7c5` — Generalize explorer: snapshot-based tree reading (~60x faster), persistent-nav detection, depth-first prioritization, remove all app-specific code
+
+### What Is Built (22 Swift files + 1 harness test file)
+
+| Layer | Files | Status |
+|-------|-------|--------|
+| **Entry point** | `OpenClawQAApp.swift`, `ContentView.swift` | Working |
+| **Models** | `Models.swift` | Complete: QAProject, QARun, QAFinding, ScreenSnapshot, ActionEvent, CoverageNode, RunPhaseEvent, QAArtifact, enums |
+| **Database** | `DatabaseManager.swift` | SQLite3, 11 tables, CRUD for all model types |
+| **Services** | `OrchestratorService.swift` | Full pipeline: git→build→boot→install→launch→explore→analyze→summarize |
+| | `ExplorationService.swift` | Builds and runs harness, parses OCQA_ protocol in real-time |
+| | `RunnerService.swift` | Shell command wrapper, xcodebuild, simctl |
+| | `KeychainService.swift` | macOS Keychain read/write (stub, not wired to UI) |
+| **Views** | `SidebarView`, `OverviewView`, `RunsListView`, `RunDetailView`, `FindingsView`, `CoverageView`, `InsightsView`, `IntegrationsView`, `SettingsView`, `ProjectSetupWizard`, `Components` | All data-driven, no mock data |
+| **Theme** | `Theme.swift` | Colors, typography, spacing constants |
+| **State** | `AppState.swift` | @Observable, async run execution, auto-creates ResiLife project from ~/repos/iosApp |
+| **Harness** | `Harness/OCQAHarnessUITests/ExplorerTests.swift` (726 lines) | Fully generalized autonomous iOS exploration engine |
+
+### What Works End-to-End
+
+The full release check pipeline runs:
+1. OrchestratorService detects git branch/commit from local repo
+2. `xcodebuild build-for-testing` with isolated derived data
+3. `xcrun simctl boot` + `simctl install` + launch screenshot
+4. ExplorationService deploys the OCQAHarness XCUITest, parses OCQA_ protocol output in real-time
+5. Findings classified (crash, dead_end, navigation_loop, build_failure, etc.)
+6. Confidence score computed: `100 - (critical×25 + high×10 + medium×3 + low×1)`
+7. Release readiness: ready (≥70) / caution (40–69) / blocked (<40)
+8. All artifacts persisted to SQLite + local filesystem
+
+### What Does NOT Work Yet
+
+| Gap | Detail |
+|-----|--------|
+| **Visual regression** | Screenshots captured per-action in xcresult, but no baseline diffing system exists |
+| **Video recording** | RunDetailView video area is a placeholder. See "Visual Media Acquisition" section below for the chosen approach |
+| **Integration OAuth** | GitHub/Jira/Slack UI cards exist but Configure buttons are no-ops |
+| **Keychain UI** | KeychainService exists but Settings > Test Credentials buttons are stubs |
+| **Notification persistence** | Settings toggles use `.constant()` bindings — changes not saved |
+| **OrchestratorService hardcodes** | `simulatorName = "iPhone 16 Pro"`, `maxActions: 200`, `timeoutSeconds: 1800` — should come from project config |
+
+### Critical Performance Finding: Snapshot-Based Tree Reading
+
+This is the single most important engineering finding in the project. **The autonomous explorer was unusable until this was discovered and fixed.** Any future work on the explorer must preserve this optimization.
+
+**The problem**: XCUITest's standard element-by-element queries (`query.element(boundBy: i).frame`, `.label`, `.identifier`, `.isEnabled`) each make a separate IPC round-trip to the accessibility server. Reading 200+ elements this way takes 60–120 seconds per screen.
+
+**The solution**: `XCUIElement.snapshot()` fetches the **entire accessibility tree in a single IPC call**. The snapshot object contains all attributes (frame, label, identifier, elementType, isEnabled, children) already materialized in memory.
+
+**Performance comparison (25-action run on ResiLife):**
+
+| Metric | Before snapshot (element-by-element) | After snapshot |
+|--------|--------------------------------------|----------------|
+| Actions completed | 3 of 25 (timeout at 5 min) | 25 of 25 |
+| Test duration | 369 seconds | **51.5 seconds** |
+| Speed | ~123 seconds/action | **~2 seconds/action** |
+| Unique states discovered | 3 | 14 |
+| Named screens detected | 0 ("Unknown" ×3) | 5 (Emma K, Good Afternoon Emma, Priya Nair, Edit Profile, nutrition tip) |
+
+**Implementation**: `readViaSnapshot()` in ExplorerTests.swift. Falls back to `readElementByElement()` only if snapshot() throws (pre-Xcode 15 compatibility). The snapshot walker is recursive with a 200-element limit.
+
+**Additional optimizations applied:**
+- Eliminated second `readUITree()` call per action cycle (transition hash now computed cheaply from element count)
+- Simplified animation settle from element-count comparison to fixed 0.3s delay
+- Reduced app settle loop from 10 iterations to 5
+- `detectTitle()` fixed to use `rawValue: 74` (NavigationBar) and `rawValue: 48` (StaticText) since `String(describing: elementType)` produces `XCUIElementType(rawValue: N)`, not human-readable names
+
+### Exploration Engine Architecture (What Was Learned)
+
+The harness went through three iterations. Key design decisions that work:
+
+1. **Persistent-nav detection**: Tracks `elementScreenPresence` — which element keys appear on which screen hashes. Elements appearing on many screens (tab bar items) are deprioritized. Threshold: `max(2, totalDistinctStates / 2)`.
+
+2. **Depth-first prioritization**: Within a screen, interactable elements sorted by:
+   - Not-persistent over persistent (tab bar items pushed to bottom)
+   - Least-visited element first
+   - Content area (y < 88% screen height) over bottom bar
+   - Base type priority: Cell(5) > Link/Button(4) > SegmentedControl/Picker(3) > TextField(2) > Switch/Toggle(1)
+
+3. **Stuck recovery**: `repeatedStateCount >= 3` → scroll up; `>= 4` → scroll down; `>= 5` → tryGoBack() (checks nav bar back button, then Close/Cancel/Done/Dismiss buttons, then edge-swipe)
+
+4. **System alert handling**: `addUIInterruptionMonitor` auto-taps Allow/OK/Continue on iOS permission dialogs
+
+5. **Snapshot-based elements have nil xcElement**: When using snapshot-based tree reading, `SimpleElement.xcElement` is nil. Text field typing falls back to identifier-based lookup or first responder.
+
+6. **Screen fingerprint is structural, not visual**: Hash built from `type:identifier:isEnabled` for all elements. Fast to compute, stable across animation frames, but does not detect visual-only changes (that requires screenshot diff).
 
 ---
 
@@ -214,30 +320,32 @@ Artifacts may be stored locally first. Design storage abstraction with two imple
 ## Technology Requirements
 
 ### macOS app
-Use **Swift + SwiftUI** for the desktop application.
+Use **Swift + SwiftUI** for the desktop application. **This is implemented.** The app targets macOS 14+ and uses `@Observable` (not `@ObservationObject`) for state management.
 
 ### Local database
-Use **SQLite** via a robust Swift persistence layer. Do not use Core Data unless absolutely necessary. Prefer explicit schema control.
+Use **SQLite** via direct `sqlite3` C API in Swift (not GRDB, not Core Data). **This is implemented.** `DatabaseManager.swift` manages 11 tables with explicit schema control. Tables: projects, runs, findings, finding_links, screen_snapshots, action_events, artifacts, run_phase_events, suppression_rules, runners, integration_connections.
 
 ### Orchestration service
-Acceptable implementations:
-- Swift executable
-- Rust service with Swift bridge
-- local HTTP/gRPC service
-The simplest strong choice is **Swift for app + Swift local service** for early coherence.
+Currently implemented as an **embedded Swift singleton** (`OrchestratorService.shared`) within the desktop app process. It coordinates builds, simulators, exploration, and analysis sequentially. It is not yet a separate daemon process. The architecture supports extraction into a separate service if needed, but for local runner mode the embedded approach works.
 
 ### iOS app execution
-Use:
-- `xcodebuild`
-- `simctl`
-- XCTest / XCUITest
-- parsing of `.xcresult`
-- unified log collection where useful
+Uses:
+- `xcodebuild build-for-testing` and `xcodebuild test-without-building` (harness)
+- `xcrun simctl` (boot, install, launch, terminate, screenshot, device listing)
+- XCUITest via the OCQAHarness project (ExplorerTests.swift)
+- `xcrun xcresulttool` for extracting screenshots and test summaries from `.xcresult` bundles
+- Process + Pipe for real-time stdout parsing of OCQA_ protocol markers
+
+### Harness build system
+The harness at `Harness/` uses a Ruby script (`generate-harness-xcodeproj.rb`) to produce `OCQAHarness.xcodeproj`. This avoids checking in Xcode project files. The harness contains:
+- `OCQAHarness/AppDelegate.swift` — minimal host app (required by XCUITest)
+- `OCQAHarnessUITests/ExplorerTests.swift` — the autonomous exploration engine
 
 ### Avoid
 - Making the core product Electron.
-- Building the autonomous engine around brittle coordinate-only clicking.
+- Building the autonomous engine around brittle coordinate-only clicking. (**Already avoided**: the explorer uses accessibility tree + structural heuristics. Coordinates are only used for the final tap, derived from element frame geometry.)
 - Requiring users to expose API model keys in the standard flow.
+- **Per-element IPC queries for UI tree reading.** Always use `XCUIElement.snapshot()` for bulk tree reads. See "Critical Performance Finding" in the Implementation Status section.
 
 ---
 
@@ -712,7 +820,57 @@ Suppression must never delete history.
 
 ## Autonomous Exploration Engine
 
-This is the moat. Build this carefully.
+This is the moat. It is built and working. The following section describes both the design intent and the actual implementation.
+
+### Implementation Reference
+
+The engine lives in `Harness/OCQAHarnessUITests/ExplorerTests.swift` (726 lines). It is a standard XCUITest that attaches to any iOS app via bundle ID, explores autonomously, and communicates results via stdout markers (the OCQA_ protocol).
+
+**It is fully generalized — no app-specific code, no hardcoded identifiers, no hardcoded screen dimensions.** This was explicitly designed and tested to work against any iOS application.
+
+### OCQA_ Protocol Specification
+
+The harness communicates to the host process (ExplorationService.swift) via stdout markers. Each marker is a single line starting with a prefix:
+
+```
+OCQA_STATE:exploration_started max_actions=25
+OCQA_STATE:{"screen":"Good Afternoon, Emma","hash":"8a00a4bb","elements":82,"action":7}
+OCQA_ACTION:{"type":"tap","target":"Reserve Spot","elementType":"XCUIElementType(rawValue: 9)","step":9,"x":329,"y":372}
+OCQA_TRANSITION:{"from":"Good Afternoon, Emma","fromHash":"8a00a4bb","to":"pending","toHash":"0009e04f","action":"Reserve Spot"}
+OCQA_PROGRESS:{"action":9,"max":25,"states":7}
+OCQA_ISSUE:{"type":"navigation_loop","severity":"high","title":"Navigation loop on Home","screen":"Home","step":14}
+OCQA_COMPLETE:{"actions":25,"states":14,"issues":4,"screens":"Edit Profile,Emma K,Good Afternoon, Emma,Priya Nair"}
+OCQA_UITREE_START / OCQA_UITREE_END — wraps full accessibility tree JSON dump (testDumpUITree mode)
+```
+
+ExplorationService.swift parses these in real-time via Pipe readabilityHandler and creates QAFinding, ScreenSnapshot, ActionEvent, and CoverageNode records.
+
+### Test Entry Points
+
+ExplorerTests.swift provides multiple XCTest methods the orchestrator can invoke:
+
+| Method | Purpose |
+|--------|---------|
+| `testAutonomousExploration` | Full autonomous loop: read tree → pick action → act → detect transition → repeat |
+| `testDumpUITree` | One-shot: read accessibility tree, emit OCQA_UITREE JSON |
+| `testTapAtCoordinate` | Single tap at (x,y) — for engine-directed actions |
+| `testTapById` | Single tap by accessibility identifier |
+| `testSwipe` | Swipe in configured direction |
+| `testTypeText` | Type text into identified or first text field |
+| `testGoBack` | Navigate back (nav bar button or edge swipe) |
+| `testScreenshot` | Capture and attach a screenshot |
+
+### Configuration
+
+The harness reads config from `/tmp/ocqa-run-config.json`:
+```json
+{
+  "OCQA_BUNDLE_ID": "com.example.app",
+  "OCQA_MAX_ACTIONS": "200",
+  "OCQA_TIMEOUT_SECONDS": "1800"
+}
+```
+Falls back to environment variables if not found.
 
 ## Core objectives
 - Explore arbitrary app surfaces without requiring exhaustive manual test scripts.
@@ -723,11 +881,11 @@ This is the moat. Build this carefully.
 - Prefer meaningful user-like flows over random tapping.
 
 ## Inputs
-- accessibility tree
+- accessibility tree (via XCUIElement.snapshot() — single IPC call)
 - currently visible UI elements
 - app state history
 - previous actions
-- screenshots
+- screenshots (attached to xcresult per action)
 - deterministic check definitions
 - project auth configuration
 - permission policy
@@ -735,75 +893,68 @@ This is the moat. Build this carefully.
 
 ## Internal state model
 For each step, track:
-- visible elements
-- candidate actions
-- action scores
-- current screen fingerprint
+- visible elements (via snapshot-based tree read, up to 200 elements)
+- candidate actions (filtered by isEnabled && isInteractable && isHittable)
+- action scores (computed by `prioritizeElements()` — see prioritization below)
+- current screen fingerprint (structural hash of type:identifier:isEnabled for all elements)
 - previous screen fingerprint
-- current path
-- visited path signatures
-- navigation stack estimate
-- blockers
-- expected vs observed result
-- confidence in screen classification
+- elementScreenPresence map (element key → set of screen hashes it appeared on)
+- actionCounts map (element key → number of times acted upon)
+- totalDistinctStates counter
+- repeatedStateCount (consecutive identical state hashes)
+- stateTransitions array
+- issues array
 
 ### Screen fingerprint
-A screen fingerprint should be built from:
-- top-level accessibility labels/types
-- navigation title
-- tab state
-- visible button labels
-- collection/list structure hints
-- stable screenshot hash
-Use a fuzzy fingerprint plus exact signature.
+Implemented in `computeHash()`:
+- Concatenates `type:identifier:isEnabled` for all elements, joined by `|`
+- Applies djb2 hash → hex string
+- This is a **structural** fingerprint, not visual. Two screens with identical element trees but different rendered content (e.g., different list data) will hash the same.
+- For visual-level change detection, use screenshot diffing (not yet implemented).
+
+### Screen title detection
+Implemented in `detectTitle()`:
+- First checks for NavigationBar elements (`rawValue: 74`) — returns identifier or label
+- Falls back to largest StaticText (`rawValue: 48`) in the top 25% of the screen
+- This works well in practice: detected "Good Afternoon, Emma", "Priya Nair", "Edit Profile", "Emma K"
 
 ## Action types
-- tap element
-- type into field
-- submit form
-- scroll vertically
-- scroll horizontally
-- swipe page
-- dismiss modal
-- go back
-- handle system permission alert
-- relaunch after crash if policy allows
-- wait for transition
-- no-op snapshot for comparison
+- tap element (via coordinate, derived from element frame)
+- type into text field (with heuristic text: email→test@example.com, password→TestPass123!, phone→5551234567, name→Test User, zip→90210, search→test, default→test input)
+- scroll vertically (normalized coordinate drag 0.78↔0.30)
+- go back (nav bar button → Close/Cancel/Done/Dismiss buttons → edge swipe)
+- handle system permission alert (via addUIInterruptionMonitor: Allow, Allow While Using App, OK, Continue, Allow Full Access)
+- dismiss keyboard (tap above keyboard frame)
+- screenshot (attached per action as XCTest attachment)
 
-## Required prioritization heuristic
-Prioritize actions in this order when appropriate:
-1. Deterministic check next step
-2. Authentication completion
-3. Permission handling
-4. Primary CTA on new screen
-5. Previously unseen navigation action
-6. Tab switch to unexplored area
-7. Detail drill-down into list item not yet seen
-8. Back-navigation to branch to alternative path
-9. Low-value repeated scrolls last
+## Implemented prioritization heuristic
 
-## Loop prevention
-The engine must detect:
-- repeated screen-action-screen cycles
-- repeated screen fingerprints with no net change
-- repeated failed interactions
-- repeated modals or auth bounce loops
+The `prioritizeElements()` function sorts interactable elements by this priority (highest first):
+
+1. **Not persistent** over persistent: Elements appearing on fewer than `max(2, totalDistinctStates/2)` distinct screens are prioritized. This automatically deprioritizes tab bar icons, bottom navigation, and other omnipresent elements.
+2. **Least-visited first**: Elements with fewer recorded taps (`actionCounts[key]`) are preferred.
+3. **Content area over bottom bar**: Elements above 88% of screen height are preferred over those in the bottom bar area.
+4. **Base type priority**: Cell/rawValue:75 (5) > Link/rawValue:39, Button/rawValue:9 (4) > SegmentedControl/Picker (3) > TextField/rawValue:49,50 (2) > Switch/Toggle/rawValue:40 (1) > Other (0)
+
+An element is skipped if it has been acted upon 3+ times. If all elements exceed this, the first sorted element is used anyway.
+
+## Loop prevention (implemented)
+The engine detects:
+- **Repeated state**: If same screen hash appears 3+ consecutive times → scroll up, then scroll down, then tryGoBack()
+- **Navigation loop**: If last 8 state transitions contain ≤ 2 unique destination hashes → emit OCQA_ISSUE, tryGoBack()
+- **Dead end**: If no interactable elements found → emit OCQA_ISSUE, tryGoBack, or terminate
 
 On loop detection:
-- back out if possible
-- mark dead-end if trapped
-- lower future score for same action
-- optionally relaunch from home state if configured
+- Back out via nav bar back button, then Close/Cancel/Done/Dismiss buttons, then edge swipe
+- Mark dead-end in findings
+- Issue emitted as `navigation_loop` or `dead_end` with severity
 
-## Required exploration outputs
-- screen graph
-- action graph
-- path list
-- unexplored candidate list
-- dead ends
-- unstable transitions
-- state traps
+## Required exploration outputs (all implemented)
+- screen graph (via OCQA_TRANSITION: from→to with action label)
+- action graph (via OCQA_ACTION: full action log with coordinates)
+- state list (via OCQA_STATE: per-action screen state)
+- issues (via OCQA_ISSUE: dead_end, navigation_loop, crash)
+- OCQA_COMPLETE summary: actions, states, issues, screen names
 
 ---
 
@@ -811,18 +962,21 @@ On loop detection:
 
 The product must support lightweight deterministic checks, but they are not the hero feature.
 
+### Current state
+OrchestratorService runs a basic launch check: `simctl launch` → wait 3s → `simctl io screenshot` → `simctl terminate`. The launch screenshot is stored as an artifact. There is no structured check execution beyond this — the exploration engine handles the rest.
+
 ### Purpose
 - validate critical flows reliably
 - produce clean pass/fail outcomes
 - provide structure before autonomous exploration
 
 ### Supported initial check types
-- launch app
-- login
-- tab navigation
-- open profile
-- open settings
-- logout
+- launch app ✅ (implemented)
+- login (not yet — depends on test credentials)
+- tab navigation (autonomous explorer does this naturally)
+- open profile (autonomous explorer does this naturally)
+- open settings (autonomous explorer does this naturally)
+- logout (not yet)
 - custom sequence (future advanced)
 
 ### Implementation requirement
@@ -851,41 +1005,53 @@ not as a top-level “Test Explorer” product identity.
 
 ## Accessibility Strategy
 
-This product must heavily leverage accessibility metadata, but cannot assume perfect app instrumentation.
+This product heavily leverages accessibility metadata. The explorer already works across varying levels of app instrumentation.
 
-### Required best-case support
-If app exposes accessibility identifiers and labels well, use them as first-class selectors.
+### Current implementation
+The explorer reads the full accessibility tree via `XCUIElement.snapshot()` and uses a layered identification strategy:
+1. **Accessibility identifier** (e.g., `resident.menu.open`, `resident.home.wellnessCheckIn`) — most reliable, used for action keys and logging
+2. **Accessibility label** (e.g., `"Reserve Spot"`, `"Back"`, `"house"`, `"paperplane.fill"`) — used when identifier is empty
+3. **Frame position** (e.g., `frame:220x293`) — fallback when both identifier and label are empty
+4. **Element type** (e.g., `rawValue: 9` = Button, `rawValue: 75` = Cell) — used for prioritization and interactability filtering
 
-### Required fallback support
+### Observed behavior in practice (ResiLife)
+- Many ResiLife UI elements have good accessibility identifiers (e.g., `resident.home.curatedForYou`, `resident.sideMenu.overlay`)
+- Some elements have only SF Symbol names as labels (e.g., `house`, `leaf`, `person.2`, `paperplane.fill`, `plus.circle.fill`, `xmark`)
+- Some elements have empty identifier AND empty label — these fall back to frame-based keys and are still tapped successfully via coordinate
+- NavigationBar titles are detected via `rawValue: 74`
+
+### Required fallback support (implemented)
 If identifiers are missing:
-- use accessibility labels/types
-- use relative element position within stable containers
-- use screen classification + element text
-- reduce confidence appropriately
+- use accessibility labels/types ✅
+- use relative element position via frame coordinates ✅
+- use screen classification + element text ✅
+- reduce confidence appropriately (frame-based keys are less stable across screen sizes)
 
-### Product UX requirement
+### Product UX requirement (future)
 The app should surface accessibility quality issues as developer-facing recommendations:
 - missing identifiers on key actions
 - ambiguous labels
 - unstable duplicate controls
-This is valuable and should be a separate recommendation type, not necessarily a failure.
+This is valuable and should be a separate recommendation type, not necessarily a failure. **Not yet implemented.**
 
 ---
 
 ## Build and Runner Requirements
 
-## Local runner
-Must support:
-- repo checkout or local path
-- isolated derived data location
-- dependency bootstrap
-- xcodebuild build
-- simulator lifecycle
-- app install/uninstall
-- test execution
-- artifact collection
+## Local runner (implemented)
+Currently supports:
+- repo checkout or local path ✅ (auto-detects `~/repos/iosApp`)
+- isolated derived data location ✅ (`/tmp/openclaw-qa-derived/<runId>`)
+- dependency bootstrap (not yet — no CocoaPods/SPM resolution step)
+- xcodebuild build ✅ (build-for-testing with .project or .workspace)
+- simulator lifecycle ✅ (boot, shutdown, install, launch, terminate, screenshot)
+- app install/uninstall ✅ (via simctl install)
+- test execution ✅ (xcodebuild test-without-building → harness)
+- artifact collection ✅ (xcresult, build logs, launch screenshot, exploration log)
 
-## Remote runner
+**Known limitation**: OrchestratorService hardcodes `simulatorName = "iPhone 16 Pro"`. Needs to be configurable from project settings.
+
+## Remote runner (designed, not implemented)
 Design interfaces for:
 - registered runner identity
 - labels (xcode version, simulator availability, hardware profile)
@@ -895,8 +1061,10 @@ Design interfaces for:
 - artifact upload
 - run logs stream
 
+The current SSH-based workflow (Linux → Mac) is a manual prototype of remote runner mode. Formalizing this into the app's runner abstraction is a natural next step.
+
 ## Xcode support
-The product must handle multiple Xcode versions. Runner should report installed versions and chosen version per run.
+The product must handle multiple Xcode versions. Runner should report installed versions and chosen version per run. **Currently**: OrchestratorService reads `xcodebuild -version` and stores the result.
 
 ## Simulator support
 Required initial target profiles:
@@ -986,7 +1154,13 @@ The UI and docs must clearly tell users that good autonomous testing often requi
 
 ## Visual Regression System
 
-Visual regression is a required major feature.
+Visual regression is a required major feature. **Not yet implemented**, but the data foundation is in place.
+
+### Current state
+- Per-action screenshots are captured as XCTest attachments in the xcresult bundle during exploration
+- Screen fingerprints (structural hashes) are computed for every state
+- ExplorationService has `extractScreenshots(from:to:runId:snapshots:)` to pull PNGs from xcresult
+- No baseline storage or diffing exists yet
 
 ### Scope
 Detect meaningful UI changes between comparable runs/screens:
@@ -1001,9 +1175,9 @@ Detect meaningful UI changes between comparable runs/screens:
 
 ### Implementation guidance
 Use a combination of:
-- screenshot diffing
-- structural metadata from accessibility tree
-- screen fingerprint matching
+- screenshot diffing (pixel-level or perceptual hash)
+- structural metadata from accessibility tree (the screen fingerprint already detects structural changes)
+- screen fingerprint matching (already implemented — use hash to pair screens across runs)
 - region-level change detection
 - heuristics to ignore expected dynamic content where possible
 
@@ -1024,13 +1198,19 @@ Each visual regression finding must show:
 
 ## Release Confidence Model
 
-Every completed run must produce a release confidence result.
+Every completed run produces a release confidence result. **This is implemented.**
+
+### Implemented algorithm
+```
+score = 100 - (critical×25 + high×10 + medium×3 + low×1 + testFails×5)
+readiness = score >= 70 ? .ready : score >= 40 ? .caution : .blocked
+```
 
 ### Required output fields
-- release_readiness: `ready`, `caution`, `blocked`
-- confidence_score: 0–100
-- summary_reason
-- contributing_factors array
+- release_readiness: `ready`, `caution`, `blocked` ✅
+- confidence_score: 0–100 ✅
+- summary_reason ✅ (generated from findings counts)
+- contributing_factors array (partially — findings counts are tracked, not yet a structured factors array)
 
 ### Inputs to confidence score
 - build success
@@ -1439,19 +1619,66 @@ For every run collect as applicable:
 - structured logs
 - build logs
 - simulator/device logs
-- screenshots
-- replay video
-- accessibility snapshots
-- xcresult reference
+- screenshots (already captured per-action as XCTest attachments in xcresult)
+- replay video (see Visual Media Acquisition below)
+- accessibility snapshots (available via testDumpUITree)
+- xcresult reference (already returned by ExplorationService)
 - crash logs
 - run summary JSON
 - compare summary JSON
 
 ### Video requirement
-If full-screen video recording is difficult in v1, ensure at minimum:
-- timestamped screenshot timeline
-- optional simulator screen recording when feasible
-Design interface as if video exists; degrade gracefully with screenshot replay.
+The exploration harness captures per-action screenshots as XCTest attachments inside the `.xcresult` bundle. These are extractable via `xcrun xcresulttool export attachments`. This is the primary evidence mechanism today.
+
+For full motion video or on-demand screenshot acquisition of specific screens, use the **Visual Media Acquisition** system described below.
+
+---
+
+## Visual Media Acquisition (ewag-capture.sh Integration)
+
+### Purpose and Architecture
+
+The project has a proven visual capture pipeline at `~/.openclaw/scripts/ewag-capture.sh` that handles screenshot and video recording via a Mac-hosted iOS agent. This system is the **chosen approach** for acquiring real rendered media when the automation needs it — not for routine per-action screenshots (those come from XCTest attachments) but for **targeted, high-fidelity captures** in specific situations:
+
+1. **When the explorer gets stuck on ambiguous UI**: If the engine hits a navigation loop or dead-end and cannot determine what the screen actually looks like, it can request a real screenshot for diagnosis or human review.
+2. **When visual regression detection needs a clean baseline**: Screenshot diffs require pixel-accurate captures at consistent states, not mid-transition XCTest snapshots.
+3. **When aesthetic or layout feedback is needed**: For findings classified as `layout_overlap`, `text_clipping`, `blank_screen`, or `visual_regression`, attaching a real rendered screenshot or short video is more valuable than accessibility metadata alone.
+4. **For run-level summary recordings**: A full-run screen recording (start before exploration, stop after) gives the user a video replay of exactly what happened.
+
+### How ewag-capture.sh Works
+
+The script orchestrates captures via SSH to the Mac runner:
+
+- **Screenshot mode**: Runs an XCUITest case via `ios-agent test`, extracts PNG from the xcresult bundle via `xcresulttool export attachments`, copies to local storage, optionally uploads to Google Drive.
+- **Record mode**: Runs `ios-agent record-test`, captures MP4, converts to WebM via ffmpeg, uploads.
+- **Scroll mode**: Runs a scroll-through test case, records the scrolling, trims the lead-in, converts to WebM.
+
+Key infrastructure facts:
+- Mac runner: `taylorolsen-vogt@100.125.133.123` (Tailscale)
+- ios-agent binary: `/Users/taylorolsen-vogt/ios-agent/ios-agent`
+- Artifacts dir: `/Users/taylorolsen-vogt/ios-agent/artifacts/`
+- Google Drive upload via `gog drive upload` (OAuth configured)
+- ffmpeg on Linux host for MP4→WebM conversion
+
+### Integration Path for OpenClawQA
+
+The ExplorationService should be extended to support on-demand media acquisition:
+
+1. **Run-level video**: Before calling `testAutonomousExploration`, optionally start `xcrun simctl io <UDID> recordVideo /tmp/ocqa-run-<runId>.mov`. After exploration completes, stop recording. Convert and store as run artifact. This is the simplest approach for full-run video.
+
+2. **On-demand screenshot**: When the explorer detects a stuck state, dead-end, or visual finding, invoke `testScreenshot` (already implemented in ExplorerTests.swift) to capture a clean frame, or call `xcrun simctl io <UDID> screenshot` directly.
+
+3. **Post-run screenshot extraction**: The xcresult bundle already contains per-action screenshots. ExplorationService.swift has `extractScreenshots(from:to:runId:snapshots:)` which calls `xcresulttool export attachments`. This is implemented but needs wiring to the artifact viewer in RunDetailView.
+
+4. **Google Drive upload for shared artifacts**: For CI/CD or remote review scenarios, reuse ewag-capture.sh's Drive upload function (`gog drive upload`) to push findings screenshots to a shared folder.
+
+### Important Design Constraint
+
+Do NOT capture screenshots for every action via simctl or ios-agent during exploration. The per-action XCTest attachments in the xcresult bundle already serve this purpose and are collected at zero additional latency. External capture (simctl/ios-agent) should be reserved for:
+- Run-level video (one start/stop per run)
+- Targeted captures at finding points
+- Baseline captures for visual regression
+- Human-review escalation
 
 ---
 
@@ -1492,7 +1719,7 @@ Design queue and runner abstractions so future concurrency is possible, but do n
 
 ## Security and Privacy Requirements
 
-- Use macOS Keychain for secrets.
+- Use macOS Keychain for secrets. (`KeychainService.swift` exists but is not yet wired to UI.)
 - Do not log secrets.
 - Redact known secret values in logs and exported reports.
 - Allow users to disable screenshot/video capture for sensitive screens in future design, but do not block v1 on it.
@@ -1500,34 +1727,136 @@ Design queue and runner abstractions so future concurrency is possible, but do n
 
 ---
 
+## Mac Runner Environment
+
+### Current Setup
+- **Mac host**: `taylorolsen-vogt@100.125.133.123` (Tailscale IP)
+- **Xcode**: 16.x on macOS 14.5
+- **Simulators available**: iPhone 16 Pro (`CBF1BFB1`), iPhone 16 Pro Max (`13BE13C7`, iOS 18.3.1)
+- **Git**: Can pull from GitHub, cannot push (no credential in osxkeychain). All pushes happen from the Linux build server.
+- **ios-agent**: `/Users/taylorolsen-vogt/ios-agent/ios-agent` — a separate binary for test execution and recording (used by ewag-capture.sh)
+- **App under test**: ResiLife (`com.elitepro.resilife`) at `~/repos/iosApp`
+- **Harness derived data**: `/tmp/ocqa-harness-dd` (used during development testing) and `~/Library/Application Support/OpenClawQA/HarnessDerivedData` (production path)
+
+### Running Tests from Linux (Current Development Workflow)
+
+```bash
+# Write config and run exploration
+ssh taylorolsen-vogt@100.125.133.123 \
+  "echo '{\"OCQA_BUNDLE_ID\":\"com.elitepro.resilife\",\"OCQA_MAX_ACTIONS\":\"25\",\"OCQA_TIMEOUT_SECONDS\":\"300\"}' > /tmp/ocqa-run-config.json && \
+   xcodebuild test-without-building \
+     -project ~/repos/OpenClawQA/Harness/OCQAHarness.xcodeproj \
+     -scheme OCQAHarnessUITests \
+     -destination 'platform=iOS Simulator,id=13BE13C7-7498-49DA-84BA-5F96A55A8AC7' \
+     -only-testing:OCQAHarnessUITests/ExplorerTests/testAutonomousExploration \
+     -derivedDataPath /tmp/ocqa-harness-dd 2>&1 > /tmp/ocqa-test-output.txt"
+
+# Check results
+ssh taylorolsen-vogt@100.125.133.123 "grep OCQA_ /tmp/ocqa-test-output.txt"
+```
+
+### When Running Locally on the Mac (Target State)
+
+When the agent runs on the Mac directly, the SSH layer disappears. ExplorationService.swift already handles direct local execution via Process/Pipe. The orchestrator just needs to be invoked from the desktop app UI.
+
+---
+
+## Open Tasks for Next Agent
+
+> Priority order. Items marked BLOCKED require human action first.
+
+### 1. Wire Run-Level Video Recording
+- Before `testAutonomousExploration`, start `xcrun simctl io <UDID> recordVideo /path/to/video.mov`
+- After exploration, stop recording (kill the simctl process)
+- Convert .mov to .mp4 or .webm
+- Store as run artifact, wire to RunDetailView video player
+- **Not blocked — can be implemented now**
+
+### 2. Visual Regression Baseline System
+- Store per-screen-hash baseline screenshots in SQLite (or filesystem with DB index)
+- On subsequent runs, compare screenshots of matching screen hashes
+- Use pixel diff or perceptual hash for change detection
+- Flag regressions as findings with before/after evidence
+- **Not blocked — screenshots already in xcresult**
+
+### 3. Extract and Display Per-Action Screenshots
+- ExplorationService.swift has `extractScreenshots(from:to:runId:snapshots:)` — verify it works
+- Wire extracted screenshots to RunDetailView's screenshot timeline
+- Each screenshot should link to its step number and screen state
+- **Not blocked**
+
+### 4. Make OrchestratorService Configurable
+- Replace hardcoded `simulatorName = "iPhone 16 Pro"` with project config value
+- Replace hardcoded `maxActions: 200`, `timeoutSeconds: 1800` with project-level settings
+- Add simulator selection to ProjectSetupWizard
+- **Not blocked**
+
+### 5. Wire Keychain to Settings UI
+- SettingsView has Test Credentials section with edit buttons — currently no-ops
+- Wire to KeychainService.swift read/write
+- Store secret references (not values) in project config
+- **Not blocked**
+
+### 6. Wire Notification Persistence
+- Settings toggles for notifications use `.constant()` bindings
+- Persist to UserDefaults or SQLite settings table
+- **Not blocked**
+
+### 7. (BLOCKED) Test Credentials for ResiLife
+- The explorer types generic placeholder text into login fields
+- If ResiLife requires real auth, Aaron needs to create test account credentials
+- Consider: does the app have a demo mode? The current test data shows "Emma K" profile suggesting a seeded demo account exists
+
+### 8. (BLOCKED) Integration OAuth Setup
+- GitHub, Jira, Slack cards are UI stubs
+- Aaron needs to decide which integrations are priority and create OAuth apps/API tokens
+- The UI scaffolding is ready to receive wiring
+
+### 9. (BLOCKED) GitHub Credentials on Mac
+- Mac cannot push to GitHub — no stored credential
+- Either add a PAT to Mac's osxkeychain, or continue pushing from Linux only
+- Aaron's decision
+
+---
+
 ## Coding Instructions for the Agent
 
-### Implementation order
-Build in this exact order unless blocked:
+### What is already built (do not rebuild)
+The following are complete and working. Do not rewrite from scratch:
 
-1. macOS app shell with navigation and project storage
-2. local database schema and repositories
-3. project setup wizard with repo/target detection
-4. local runner service
-5. structured command execution layer
-6. xcodebuild + simctl orchestration
-7. run model + phase event streaming into UI
-8. deterministic checks execution
-9. screenshot collection + artifact model
-10. run detail screen
-11. finding model + manual insertion from deterministic failures
-12. accessibility snapshot extraction
-13. autonomous exploration engine v1
-14. findings classification engine
-15. coverage visualization
-16. GitHub integration
-17. Slack integration
-18. Jira integration
-19. email integration
-20. CI/CD trigger ingestion
-21. comparison view
-22. release confidence model
-23. remote runner abstractions
+1. ✅ macOS app shell with navigation and project storage
+2. ✅ local database schema (11 SQLite3 tables) and CRUD
+3. ✅ project setup wizard with repo/target detection
+4. ✅ local runner service (xcodebuild, simctl)
+5. ✅ structured command execution layer
+6. ✅ xcodebuild + simctl orchestration
+7. ✅ run model + phase event streaming into UI
+8. ✅ deterministic checks (launch check)
+9. ✅ screenshot collection + artifact model
+10. ✅ run detail screen
+11. ✅ finding model + finding creation from exploration
+12. ✅ accessibility snapshot extraction (testDumpUITree)
+13. ✅ autonomous exploration engine (fully generalized, snapshot-optimized)
+14. ✅ findings classification (crash, dead_end, navigation_loop, build_failure)
+15. ✅ coverage visualization (CoverageView with real transition data)
+16. ✅ release confidence model (score + readiness level)
+
+### Implementation order for remaining work
+Build in this order unless blocked:
+
+1. **Wire run-level video recording** — simctl recordVideo start/stop around exploration
+2. **Extract per-action screenshots from xcresult** — verify and wire to RunDetailView timeline
+3. **Visual regression baseline system** — store baseline per screen hash, pixel diff on rerun
+4. **Make OrchestratorService configurable** — simulator name, maxActions, timeout from project config
+5. **Wire KeychainService to Settings UI** — test credentials edit buttons
+6. **Persist notification settings** — replace `.constant()` bindings
+7. **GitHub integration** — OAuth flow, PR comments, check-run status
+8. **Slack integration** — webhook, run summaries, critical finding alerts
+9. **Jira integration** — issue creation from findings
+10. **Email integration** — SMTP/transactional for run summaries
+11. **CI/CD trigger ingestion** — GitHub Actions, Xcode Cloud
+12. **Comparison view** — run A vs run B diff
+13. **Remote runner abstractions** — formalize the SSH-based workflow into proper runner protocol
 
 ### UI priorities
 The first polished screens must be:

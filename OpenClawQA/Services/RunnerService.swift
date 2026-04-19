@@ -118,6 +118,39 @@ final class RunnerService {
         return await runShellCommand("ssh", arguments: args)
     }
 
+    // MARK: - Video Recording
+
+    /// Start recording the simulator screen. Returns the Process so it can be stopped later.
+    func startVideoRecording(udid: String, outputPath: String) -> Process? {
+        let process = Process()
+        let paths = ["/usr/bin/xcrun", "/usr/local/bin/xcrun", "/opt/homebrew/bin/xcrun"]
+        var execPath: String?
+        for p in paths {
+            if FileManager.default.fileExists(atPath: p) { execPath = p; break }
+        }
+        guard let resolvedPath = execPath else { return nil }
+
+        process.executableURL = URL(fileURLWithPath: resolvedPath)
+        process.arguments = ["simctl", "io", udid, "recordVideo", "--codec=h264", outputPath]
+        process.standardOutput = Pipe()
+        process.standardError = Pipe()
+
+        do {
+            try process.run()
+            return process
+        } catch {
+            return nil
+        }
+    }
+
+    /// Stop a running video recording process gracefully via SIGINT.
+    func stopVideoRecording(_ process: Process) {
+        if process.isRunning {
+            process.interrupt() // SIGINT triggers graceful stop
+            process.waitUntilExit()
+        }
+    }
+
     // MARK: - Helpers (public for orchestrator access)
     func runShellCommand(_ command: String, arguments: [String]) async -> String? {
         let process = Process()
@@ -144,9 +177,24 @@ final class RunnerService {
 
         do {
             try process.run()
+
+            // Read pipes concurrently to avoid deadlock when output exceeds buffer size
+            var outData = Data()
+            var errData = Data()
+            let group = DispatchGroup()
+            group.enter()
+            DispatchQueue.global().async {
+                outData = outPipe.fileHandleForReading.readDataToEndOfFile()
+                group.leave()
+            }
+            group.enter()
+            DispatchQueue.global().async {
+                errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+                group.leave()
+            }
             process.waitUntilExit()
-            let outData = outPipe.fileHandleForReading.readDataToEndOfFile()
-            let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+            group.wait()
+
             let output = String(data: outData, encoding: .utf8) ?? ""
             let errOutput = String(data: errData, encoding: .utf8) ?? ""
             return output + (errOutput.isEmpty ? "" : "\n" + errOutput)

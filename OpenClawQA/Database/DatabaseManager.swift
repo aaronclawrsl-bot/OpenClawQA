@@ -5,6 +5,7 @@ import SQLite3
 final class DatabaseManager {
     static let shared = DatabaseManager()
     private var db: OpaquePointer?
+    private let queue = DispatchQueue(label: "com.openclaw.database", qos: .userInitiated)
 
     private init() {
         openDatabase()
@@ -23,7 +24,9 @@ final class DatabaseManager {
         try? fileManager.createDirectory(at: appDir, withIntermediateDirectories: true)
         let dbPath = appDir.appendingPathComponent("openclaw-qa.db").path
 
-        if sqlite3_open(dbPath, &db) != SQLITE_OK {
+        // Open in serialized mode (SQLITE_OPEN_FULLMUTEX) for thread-safe access
+        let flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX
+        if sqlite3_open_v2(dbPath, &db, flags, nil) != SQLITE_OK {
             print("Error opening database: \(String(cString: sqlite3_errmsg(db)))")
         }
         execute("PRAGMA journal_mode=WAL")
@@ -42,6 +45,11 @@ final class DatabaseManager {
             return false
         }
         return true
+    }
+
+    /// Serialize all DB access to prevent concurrent access crashes
+    private func synchronized<T>(_ work: () -> T) -> T {
+        queue.sync { work() }
     }
 
     // MARK: - Create Tables
@@ -240,267 +248,297 @@ final class DatabaseManager {
 
     // MARK: - Projects CRUD
     func fetchProjects() -> [QAProject] {
-        var projects: [QAProject] = []
-        var stmt: OpaquePointer?
-        if sqlite3_prepare_v2(db, "SELECT * FROM projects ORDER BY updated_at DESC", -1, &stmt, nil) == SQLITE_OK {
-            while sqlite3_step(stmt) == SQLITE_ROW {
-                projects.append(projectFromRow(stmt!))
+        synchronized {
+            var projects: [QAProject] = []
+            var stmt: OpaquePointer?
+            if sqlite3_prepare_v2(db, "SELECT * FROM projects ORDER BY updated_at DESC", -1, &stmt, nil) == SQLITE_OK {
+                while sqlite3_step(stmt) == SQLITE_ROW {
+                    projects.append(projectFromRow(stmt!))
+                }
             }
+            sqlite3_finalize(stmt)
+            return projects
         }
-        sqlite3_finalize(stmt)
-        return projects
     }
 
     func insertProject(_ p: QAProject) {
-        let sql = "INSERT INTO projects (id, name, repo_type, repo_identifier, local_repo_path, default_branch, workspace_path, project_path, scheme, configuration, bundle_id, runner_mode, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
-        var stmt: OpaquePointer?
-        if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK {
-            bindText(stmt, 1, p.id); bindText(stmt, 2, p.name); bindText(stmt, 3, p.repoType)
-            bindText(stmt, 4, p.repoIdentifier); bindText(stmt, 5, p.localRepoPath)
-            bindText(stmt, 6, p.defaultBranch); bindText(stmt, 7, p.workspacePath)
-            bindText(stmt, 8, p.projectPath); bindText(stmt, 9, p.scheme)
-            bindText(stmt, 10, p.configuration); bindText(stmt, 11, p.bundleId)
-            bindText(stmt, 12, p.runnerMode); bindText(stmt, 13, dateStr(p.createdAt))
-            bindText(stmt, 14, dateStr(p.updatedAt))
-            sqlite3_step(stmt)
+        synchronized {
+            let sql = "INSERT INTO projects (id, name, repo_type, repo_identifier, local_repo_path, default_branch, workspace_path, project_path, scheme, configuration, bundle_id, runner_mode, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+            var stmt: OpaquePointer?
+            if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK {
+                bindText(stmt, 1, p.id); bindText(stmt, 2, p.name); bindText(stmt, 3, p.repoType)
+                bindText(stmt, 4, p.repoIdentifier); bindText(stmt, 5, p.localRepoPath)
+                bindText(stmt, 6, p.defaultBranch); bindText(stmt, 7, p.workspacePath)
+                bindText(stmt, 8, p.projectPath); bindText(stmt, 9, p.scheme)
+                bindText(stmt, 10, p.configuration); bindText(stmt, 11, p.bundleId)
+                bindText(stmt, 12, p.runnerMode); bindText(stmt, 13, dateStr(p.createdAt))
+                bindText(stmt, 14, dateStr(p.updatedAt))
+                sqlite3_step(stmt)
+            }
+            sqlite3_finalize(stmt)
         }
-        sqlite3_finalize(stmt)
     }
 
     // MARK: - Runs CRUD
     func fetchRuns(projectId: String) -> [QARun] {
-        var runs: [QARun] = []
-        var stmt: OpaquePointer?
-        let sql = "SELECT * FROM runs WHERE project_id = ? ORDER BY started_at DESC"
-        if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK {
-            bindText(stmt, 1, projectId)
-            while sqlite3_step(stmt) == SQLITE_ROW {
-                runs.append(runFromRow(stmt!))
+        synchronized {
+            var runs: [QARun] = []
+            var stmt: OpaquePointer?
+            let sql = "SELECT * FROM runs WHERE project_id = ? ORDER BY started_at DESC"
+            if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK {
+                bindText(stmt, 1, projectId)
+                while sqlite3_step(stmt) == SQLITE_ROW {
+                    runs.append(runFromRow(stmt!))
+                }
             }
+            sqlite3_finalize(stmt)
+            return runs
         }
-        sqlite3_finalize(stmt)
-        return runs
     }
 
     func insertRun(_ r: QARun) {
-        let sql = """
-            INSERT INTO runs (id, project_id, trigger_source, trigger_metadata, branch, commit_sha, pr_number,
-            status, phase, runner_id, xcode_version, simulator_profile, resolved_runtime, started_at, ended_at,
-            confidence_score, release_readiness, critical_findings, high_findings, medium_findings, low_findings,
-            tests_executed, flows_explored, coverage_percent, duration_ms) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-        """
-        var stmt: OpaquePointer?
-        if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK {
-            bindText(stmt, 1, r.id); bindText(stmt, 2, r.projectId)
-            bindText(stmt, 3, r.triggerSource); bindText(stmt, 4, r.triggerMetadata)
-            bindText(stmt, 5, r.branch); bindText(stmt, 6, r.commitSha)
-            if let pr = r.prNumber { sqlite3_bind_int(stmt, 7, Int32(pr)) } else { sqlite3_bind_null(stmt, 7) }
-            bindText(stmt, 8, r.status.rawValue); bindText(stmt, 9, r.phase.rawValue)
-            bindText(stmt, 10, r.runnerId); bindText(stmt, 11, r.xcodeVersion)
-            bindText(stmt, 12, r.simulatorProfile); bindText(stmt, 13, r.resolvedRuntime)
-            bindText(stmt, 14, r.startedAt.map { dateStr($0) })
-            bindText(stmt, 15, r.endedAt.map { dateStr($0) })
-            if let cs = r.confidenceScore { sqlite3_bind_int(stmt, 16, Int32(cs)) } else { sqlite3_bind_null(stmt, 16) }
-            bindText(stmt, 17, r.releaseReadiness?.rawValue)
-            sqlite3_bind_int(stmt, 18, Int32(r.criticalFindings))
-            sqlite3_bind_int(stmt, 19, Int32(r.highFindings))
-            sqlite3_bind_int(stmt, 20, Int32(r.mediumFindings))
-            sqlite3_bind_int(stmt, 21, Int32(r.lowFindings))
-            sqlite3_bind_int(stmt, 22, Int32(r.testsExecuted))
-            sqlite3_bind_int(stmt, 23, Int32(r.flowsExplored))
-            sqlite3_bind_double(stmt, 24, r.coveragePercent)
-            if let d = r.durationMs { sqlite3_bind_int(stmt, 25, Int32(d)) } else { sqlite3_bind_null(stmt, 25) }
-            sqlite3_step(stmt)
+        synchronized {
+            let sql = """
+                INSERT INTO runs (id, project_id, trigger_source, trigger_metadata, branch, commit_sha, pr_number,
+                status, phase, runner_id, xcode_version, simulator_profile, resolved_runtime, started_at, ended_at,
+                confidence_score, release_readiness, critical_findings, high_findings, medium_findings, low_findings,
+                tests_executed, flows_explored, coverage_percent, duration_ms) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """
+            var stmt: OpaquePointer?
+            if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK {
+                bindText(stmt, 1, r.id); bindText(stmt, 2, r.projectId)
+                bindText(stmt, 3, r.triggerSource); bindText(stmt, 4, r.triggerMetadata)
+                bindText(stmt, 5, r.branch); bindText(stmt, 6, r.commitSha)
+                if let pr = r.prNumber { sqlite3_bind_int(stmt, 7, Int32(pr)) } else { sqlite3_bind_null(stmt, 7) }
+                bindText(stmt, 8, r.status.rawValue); bindText(stmt, 9, r.phase.rawValue)
+                bindText(stmt, 10, r.runnerId); bindText(stmt, 11, r.xcodeVersion)
+                bindText(stmt, 12, r.simulatorProfile); bindText(stmt, 13, r.resolvedRuntime)
+                bindText(stmt, 14, r.startedAt.map { dateStr($0) })
+                bindText(stmt, 15, r.endedAt.map { dateStr($0) })
+                if let cs = r.confidenceScore { sqlite3_bind_int(stmt, 16, Int32(cs)) } else { sqlite3_bind_null(stmt, 16) }
+                bindText(stmt, 17, r.releaseReadiness?.rawValue)
+                sqlite3_bind_int(stmt, 18, Int32(r.criticalFindings))
+                sqlite3_bind_int(stmt, 19, Int32(r.highFindings))
+                sqlite3_bind_int(stmt, 20, Int32(r.mediumFindings))
+                sqlite3_bind_int(stmt, 21, Int32(r.lowFindings))
+                sqlite3_bind_int(stmt, 22, Int32(r.testsExecuted))
+                sqlite3_bind_int(stmt, 23, Int32(r.flowsExplored))
+                sqlite3_bind_double(stmt, 24, r.coveragePercent)
+                if let d = r.durationMs { sqlite3_bind_int(stmt, 25, Int32(d)) } else { sqlite3_bind_null(stmt, 25) }
+                sqlite3_step(stmt)
+            }
+            sqlite3_finalize(stmt)
         }
-        sqlite3_finalize(stmt)
     }
 
     func updateRunStatus(_ runId: String, status: RunStatus, phase: RunPhase) {
-        execute("UPDATE runs SET status = '\(status.rawValue)', phase = '\(phase.rawValue)' WHERE id = '\(runId)'")
+        synchronized {
+            execute("UPDATE runs SET status = '\(status.rawValue)', phase = '\(phase.rawValue)' WHERE id = '\(runId)'")
+        }
     }
 
     // MARK: - Findings CRUD
     func fetchFindings(projectId: String) -> [QAFinding] {
-        var findings: [QAFinding] = []
-        var stmt: OpaquePointer?
-        let sql = "SELECT * FROM findings WHERE project_id = ? ORDER BY severity ASC, last_seen_at DESC"
-        if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK {
-            bindText(stmt, 1, projectId)
-            while sqlite3_step(stmt) == SQLITE_ROW {
-                findings.append(findingFromRow(stmt!))
+        synchronized {
+            var findings: [QAFinding] = []
+            var stmt: OpaquePointer?
+            let sql = "SELECT * FROM findings WHERE project_id = ? ORDER BY severity ASC, last_seen_at DESC"
+            if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK {
+                bindText(stmt, 1, projectId)
+                while sqlite3_step(stmt) == SQLITE_ROW {
+                    findings.append(findingFromRow(stmt!))
+                }
             }
+            sqlite3_finalize(stmt)
+            return findings
         }
-        sqlite3_finalize(stmt)
-        return findings
     }
 
     func fetchFindingsForRun(_ runId: String) -> [QAFinding] {
-        var findings: [QAFinding] = []
-        var stmt: OpaquePointer?
-        let sql = "SELECT * FROM findings WHERE run_id = ? ORDER BY severity ASC"
-        if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK {
-            bindText(stmt, 1, runId)
-            while sqlite3_step(stmt) == SQLITE_ROW {
-                findings.append(findingFromRow(stmt!))
+        synchronized {
+            var findings: [QAFinding] = []
+            var stmt: OpaquePointer?
+            let sql = "SELECT * FROM findings WHERE run_id = ? ORDER BY severity ASC"
+            if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK {
+                bindText(stmt, 1, runId)
+                while sqlite3_step(stmt) == SQLITE_ROW {
+                    findings.append(findingFromRow(stmt!))
+                }
             }
+            sqlite3_finalize(stmt)
+            return findings
         }
-        sqlite3_finalize(stmt)
-        return findings
     }
 
     func insertFinding(_ f: QAFinding) {
-        let sql = """
-            INSERT INTO findings (id, project_id, run_id, signature_hash, category, subtype, title, summary,
-            severity, confidence, status, first_seen_at, last_seen_at, evidence, repro_steps, metadata,
-            flow, screen, environment, occurrences, ai_analysis, suggested_fix, impact, affected_builds, assignee)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-        """
-        var stmt: OpaquePointer?
-        if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK {
-            bindText(stmt, 1, f.id); bindText(stmt, 2, f.projectId); bindText(stmt, 3, f.runId)
-            bindText(stmt, 4, f.signatureHash); bindText(stmt, 5, f.category.rawValue)
-            bindText(stmt, 6, f.subtype); bindText(stmt, 7, f.title); bindText(stmt, 8, f.summary)
-            bindText(stmt, 9, f.severity.rawValue); sqlite3_bind_double(stmt, 10, f.confidence)
-            bindText(stmt, 11, f.status.rawValue); bindText(stmt, 12, dateStr(f.firstSeenAt))
-            bindText(stmt, 13, dateStr(f.lastSeenAt)); bindText(stmt, 14, f.evidence)
-            bindText(stmt, 15, f.reproSteps); bindText(stmt, 16, f.metadata)
-            bindText(stmt, 17, f.flow); bindText(stmt, 18, f.screen); bindText(stmt, 19, f.environment)
-            sqlite3_bind_int(stmt, 20, Int32(f.occurrences)); bindText(stmt, 21, f.aiAnalysis)
-            bindText(stmt, 22, f.suggestedFix); bindText(stmt, 23, f.impact)
-            bindText(stmt, 24, f.affectedBuilds); bindText(stmt, 25, f.assignee)
-            sqlite3_step(stmt)
+        synchronized {
+            let sql = """
+                INSERT INTO findings (id, project_id, run_id, signature_hash, category, subtype, title, summary,
+                severity, confidence, status, first_seen_at, last_seen_at, evidence, repro_steps, metadata,
+                flow, screen, environment, occurrences, ai_analysis, suggested_fix, impact, affected_builds, assignee)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """
+            var stmt: OpaquePointer?
+            if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK {
+                bindText(stmt, 1, f.id); bindText(stmt, 2, f.projectId); bindText(stmt, 3, f.runId)
+                bindText(stmt, 4, f.signatureHash); bindText(stmt, 5, f.category.rawValue)
+                bindText(stmt, 6, f.subtype); bindText(stmt, 7, f.title); bindText(stmt, 8, f.summary)
+                bindText(stmt, 9, f.severity.rawValue); sqlite3_bind_double(stmt, 10, f.confidence)
+                bindText(stmt, 11, f.status.rawValue); bindText(stmt, 12, dateStr(f.firstSeenAt))
+                bindText(stmt, 13, dateStr(f.lastSeenAt)); bindText(stmt, 14, f.evidence)
+                bindText(stmt, 15, f.reproSteps); bindText(stmt, 16, f.metadata)
+                bindText(stmt, 17, f.flow); bindText(stmt, 18, f.screen); bindText(stmt, 19, f.environment)
+                sqlite3_bind_int(stmt, 20, Int32(f.occurrences)); bindText(stmt, 21, f.aiAnalysis)
+                bindText(stmt, 22, f.suggestedFix); bindText(stmt, 23, f.impact)
+                bindText(stmt, 24, f.affectedBuilds); bindText(stmt, 25, f.assignee)
+                sqlite3_step(stmt)
+            }
+            sqlite3_finalize(stmt)
         }
-        sqlite3_finalize(stmt)
     }
 
     // MARK: - Integrations
     func fetchIntegrations() -> [IntegrationConnection] {
-        var items: [IntegrationConnection] = []
-        var stmt: OpaquePointer?
-        if sqlite3_prepare_v2(db, "SELECT * FROM integration_connections ORDER BY type", -1, &stmt, nil) == SQLITE_OK {
-            while sqlite3_step(stmt) == SQLITE_ROW {
-                items.append(integrationFromRow(stmt!))
+        synchronized {
+            var items: [IntegrationConnection] = []
+            var stmt: OpaquePointer?
+            if sqlite3_prepare_v2(db, "SELECT * FROM integration_connections ORDER BY type", -1, &stmt, nil) == SQLITE_OK {
+                while sqlite3_step(stmt) == SQLITE_ROW {
+                    items.append(integrationFromRow(stmt!))
+                }
             }
+            sqlite3_finalize(stmt)
+            return items
         }
-        sqlite3_finalize(stmt)
-        return items
     }
 
     func insertIntegration(_ i: IntegrationConnection) {
-        let sql = "INSERT INTO integration_connections (id, type, display_name, account_identifier, is_connected, config_json, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?)"
-        var stmt: OpaquePointer?
-        if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK {
-            bindText(stmt, 1, i.id); bindText(stmt, 2, i.type.rawValue); bindText(stmt, 3, i.displayName)
-            bindText(stmt, 4, i.accountIdentifier); sqlite3_bind_int(stmt, 5, i.isConnected ? 1 : 0)
-            bindText(stmt, 6, i.configJson); bindText(stmt, 7, dateStr(i.createdAt)); bindText(stmt, 8, dateStr(i.updatedAt))
-            sqlite3_step(stmt)
+        synchronized {
+            let sql = "INSERT INTO integration_connections (id, type, display_name, account_identifier, is_connected, config_json, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?)"
+            var stmt: OpaquePointer?
+            if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK {
+                bindText(stmt, 1, i.id); bindText(stmt, 2, i.type.rawValue); bindText(stmt, 3, i.displayName)
+                bindText(stmt, 4, i.accountIdentifier); sqlite3_bind_int(stmt, 5, i.isConnected ? 1 : 0)
+                bindText(stmt, 6, i.configJson); bindText(stmt, 7, dateStr(i.createdAt)); bindText(stmt, 8, dateStr(i.updatedAt))
+                sqlite3_step(stmt)
+            }
+            sqlite3_finalize(stmt)
         }
-        sqlite3_finalize(stmt)
     }
 
     // MARK: - Runners
     func fetchRunners() -> [QARunner] {
-        var items: [QARunner] = []
-        var stmt: OpaquePointer?
-        if sqlite3_prepare_v2(db, "SELECT * FROM runners ORDER BY display_name", -1, &stmt, nil) == SQLITE_OK {
-            while sqlite3_step(stmt) == SQLITE_ROW {
-                items.append(runnerFromRow(stmt!))
+        synchronized {
+            var items: [QARunner] = []
+            var stmt: OpaquePointer?
+            if sqlite3_prepare_v2(db, "SELECT * FROM runners ORDER BY display_name", -1, &stmt, nil) == SQLITE_OK {
+                while sqlite3_step(stmt) == SQLITE_ROW {
+                    items.append(runnerFromRow(stmt!))
+                }
             }
+            sqlite3_finalize(stmt)
+            return items
         }
-        sqlite3_finalize(stmt)
-        return items
     }
 
     // MARK: - Screen Snapshots CRUD
     func insertScreenSnapshot(_ s: ScreenSnapshot) {
-        let sql = """
-            INSERT INTO screen_snapshots (id, run_id, step_index, timestamp, screen_fingerprint,
-            screenshot_path, accessibility_tree_json, screen_classification, parent_snapshot_id)
-            VALUES (?,?,?,?,?,?,?,?,?)
-        """
-        var stmt: OpaquePointer?
-        if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK {
-            bindText(stmt, 1, s.id); bindText(stmt, 2, s.runId)
-            sqlite3_bind_int(stmt, 3, Int32(s.stepIndex))
-            bindText(stmt, 4, dateStr(s.timestamp))
-            bindText(stmt, 5, s.screenFingerprint)
-            bindText(stmt, 6, s.screenshotPath)
-            bindText(stmt, 7, s.accessibilityTreeJson)
-            bindText(stmt, 8, s.screenClassification)
-            bindText(stmt, 9, s.parentSnapshotId)
-            sqlite3_step(stmt)
+        synchronized {
+            let sql = """
+                INSERT INTO screen_snapshots (id, run_id, step_index, timestamp, screen_fingerprint,
+                screenshot_path, accessibility_tree_json, screen_classification, parent_snapshot_id)
+                VALUES (?,?,?,?,?,?,?,?,?)
+            """
+            var stmt: OpaquePointer?
+            if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK {
+                bindText(stmt, 1, s.id); bindText(stmt, 2, s.runId)
+                sqlite3_bind_int(stmt, 3, Int32(s.stepIndex))
+                bindText(stmt, 4, dateStr(s.timestamp))
+                bindText(stmt, 5, s.screenFingerprint)
+                bindText(stmt, 6, s.screenshotPath)
+                bindText(stmt, 7, s.accessibilityTreeJson)
+                bindText(stmt, 8, s.screenClassification)
+                bindText(stmt, 9, s.parentSnapshotId)
+                sqlite3_step(stmt)
+            }
+            sqlite3_finalize(stmt)
         }
-        sqlite3_finalize(stmt)
     }
 
     func fetchScreenSnapshots(runId: String) -> [ScreenSnapshot] {
-        var items: [ScreenSnapshot] = []
-        var stmt: OpaquePointer?
-        let sql = "SELECT * FROM screen_snapshots WHERE run_id = ? ORDER BY step_index"
-        if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK {
-            bindText(stmt, 1, runId)
-            while sqlite3_step(stmt) == SQLITE_ROW {
-                items.append(ScreenSnapshot(
-                    id: colText(stmt!, 0), runId: colText(stmt!, 1),
-                    stepIndex: colInt(stmt!, 2),
-                    timestamp: parseDate(colText(stmt!, 3)),
-                    screenFingerprint: colText(stmt!, 4),
-                    screenshotPath: colOptText(stmt!, 5),
-                    accessibilityTreeJson: colOptText(stmt!, 6),
-                    screenClassification: colOptText(stmt!, 7),
-                    parentSnapshotId: colOptText(stmt!, 8)
-                ))
+        synchronized {
+            var items: [ScreenSnapshot] = []
+            var stmt: OpaquePointer?
+            let sql = "SELECT * FROM screen_snapshots WHERE run_id = ? ORDER BY step_index"
+            if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK {
+                bindText(stmt, 1, runId)
+                while sqlite3_step(stmt) == SQLITE_ROW {
+                    items.append(ScreenSnapshot(
+                        id: colText(stmt!, 0), runId: colText(stmt!, 1),
+                        stepIndex: colInt(stmt!, 2),
+                        timestamp: parseDate(colText(stmt!, 3)),
+                        screenFingerprint: colText(stmt!, 4),
+                        screenshotPath: colOptText(stmt!, 5),
+                        accessibilityTreeJson: colOptText(stmt!, 6),
+                        screenClassification: colOptText(stmt!, 7),
+                        parentSnapshotId: colOptText(stmt!, 8)
+                    ))
+                }
             }
+            sqlite3_finalize(stmt)
+            return items
         }
-        sqlite3_finalize(stmt)
-        return items
     }
 
     // MARK: - Action Events CRUD
     func insertActionEvent(_ e: ActionEvent) {
-        let sql = """
-            INSERT INTO action_events (id, run_id, step_index, source_snapshot_id, action_type,
-            target_descriptor, result, timestamp, duration_ms, produced_snapshot_id)
-            VALUES (?,?,?,?,?,?,?,?,?,?)
-        """
-        var stmt: OpaquePointer?
-        if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK {
-            bindText(stmt, 1, e.id); bindText(stmt, 2, e.runId)
-            sqlite3_bind_int(stmt, 3, Int32(e.stepIndex))
-            bindText(stmt, 4, e.sourceSnapshotId)
-            bindText(stmt, 5, e.actionType)
-            bindText(stmt, 6, e.targetDescriptor)
-            bindText(stmt, 7, e.result)
-            bindText(stmt, 8, dateStr(e.timestamp))
-            if let d = e.durationMs { sqlite3_bind_int(stmt, 9, Int32(d)) } else { sqlite3_bind_null(stmt, 9) }
-            bindText(stmt, 10, e.producedSnapshotId)
-            sqlite3_step(stmt)
+        synchronized {
+            let sql = """
+                INSERT INTO action_events (id, run_id, step_index, source_snapshot_id, action_type,
+                target_descriptor, result, timestamp, duration_ms, produced_snapshot_id)
+                VALUES (?,?,?,?,?,?,?,?,?,?)
+            """
+            var stmt: OpaquePointer?
+            if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK {
+                bindText(stmt, 1, e.id); bindText(stmt, 2, e.runId)
+                sqlite3_bind_int(stmt, 3, Int32(e.stepIndex))
+                bindText(stmt, 4, e.sourceSnapshotId)
+                bindText(stmt, 5, e.actionType)
+                bindText(stmt, 6, e.targetDescriptor)
+                bindText(stmt, 7, e.result)
+                bindText(stmt, 8, dateStr(e.timestamp))
+                if let d = e.durationMs { sqlite3_bind_int(stmt, 9, Int32(d)) } else { sqlite3_bind_null(stmt, 9) }
+                bindText(stmt, 10, e.producedSnapshotId)
+                sqlite3_step(stmt)
+            }
+            sqlite3_finalize(stmt)
         }
-        sqlite3_finalize(stmt)
     }
 
     func fetchActionEvents(runId: String) -> [ActionEvent] {
-        var items: [ActionEvent] = []
-        var stmt: OpaquePointer?
-        let sql = "SELECT * FROM action_events WHERE run_id = ? ORDER BY step_index"
-        if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK {
-            bindText(stmt, 1, runId)
-            while sqlite3_step(stmt) == SQLITE_ROW {
-                items.append(ActionEvent(
-                    id: colText(stmt!, 0), runId: colText(stmt!, 1),
-                    stepIndex: colInt(stmt!, 2),
-                    sourceSnapshotId: colOptText(stmt!, 3),
-                    actionType: colText(stmt!, 4),
-                    targetDescriptor: colOptText(stmt!, 5),
-                    result: colText(stmt!, 6),
-                    timestamp: parseDate(colText(stmt!, 7)),
-                    durationMs: colOptInt(stmt!, 8),
-                    producedSnapshotId: colOptText(stmt!, 9)
-                ))
+        synchronized {
+            var items: [ActionEvent] = []
+            var stmt: OpaquePointer?
+            let sql = "SELECT * FROM action_events WHERE run_id = ? ORDER BY step_index"
+            if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK {
+                bindText(stmt, 1, runId)
+                while sqlite3_step(stmt) == SQLITE_ROW {
+                    items.append(ActionEvent(
+                        id: colText(stmt!, 0), runId: colText(stmt!, 1),
+                        stepIndex: colInt(stmt!, 2),
+                        sourceSnapshotId: colOptText(stmt!, 3),
+                        actionType: colText(stmt!, 4),
+                        targetDescriptor: colOptText(stmt!, 5),
+                        result: colText(stmt!, 6),
+                        timestamp: parseDate(colText(stmt!, 7)),
+                        durationMs: colOptInt(stmt!, 8),
+                        producedSnapshotId: colOptText(stmt!, 9)
+                    ))
+                }
             }
+            sqlite3_finalize(stmt)
+            return items
         }
-        sqlite3_finalize(stmt)
-        return items
     }
 
     // MARK: - Helpers

@@ -73,23 +73,31 @@ final class AppState: ObservableObject {
 
         // Auto-create ResiLife project if no projects exist and repo is present
         if projects.isEmpty {
-            let repoPath = "/Users/taylorolsen-vogt/iosApp"
-            if FileManager.default.fileExists(atPath: repoPath + "/EWAG.xcodeproj") {
-                let project = QAProject(
-                    id: "proj-resilife-\(UUID().uuidString.prefix(8))",
-                    name: "ResiLife iOS",
-                    repoType: "local",
-                    repoIdentifier: "EWAG-dev/iosApp",
-                    localRepoPath: repoPath,
-                    defaultBranch: "main",
-                    projectPath: repoPath + "/EWAG.xcodeproj",
-                    scheme: "ResiLife",
-                    configuration: "Debug",
-                    bundleId: "com.elitepro.resilife",
-                    runnerMode: "local"
-                )
-                db.insertProject(project)
-                projects = db.fetchProjects()
+            let candidatePaths = [
+                NSHomeDirectory() + "/repos/EWAG-dev-iosApp",
+                NSHomeDirectory() + "/repos/iosApp",
+                NSHomeDirectory() + "/Developer/iosApp",
+                NSHomeDirectory() + "/Projects/iosApp"
+            ]
+            for repoPath in candidatePaths {
+                if FileManager.default.fileExists(atPath: repoPath + "/EWAG.xcodeproj") {
+                    let project = QAProject(
+                        id: "proj-resilife-\(UUID().uuidString.prefix(8))",
+                        name: "ResiLife iOS",
+                        repoType: "local",
+                        repoIdentifier: "EWAG-dev/iosApp",
+                        localRepoPath: repoPath,
+                        defaultBranch: "main",
+                        projectPath: repoPath + "/EWAG.xcodeproj",
+                        scheme: "ResiLife",
+                        configuration: "Debug",
+                        bundleId: "com.elitepro.resilife",
+                        runnerMode: "local"
+                    )
+                    db.insertProject(project)
+                    projects = db.fetchProjects()
+                    break
+                }
             }
         }
 
@@ -97,6 +105,12 @@ final class AppState: ObservableObject {
         if let pid = selectedProjectId {
             runs = db.fetchRuns(projectId: pid)
             findings = db.fetchFindings(projectId: pid)
+            // Load data for the latest run so overview shows screenshots/actions
+            if let latestId = runs.first?.id {
+                screenSnapshots = db.fetchScreenSnapshots(runId: latestId)
+                actionEvents = db.fetchActionEvents(runId: latestId)
+                artifacts = db.fetchArtifacts(runId: latestId)
+            }
         }
         integrations = db.fetchIntegrations()
     }
@@ -117,6 +131,27 @@ final class AppState: ObservableObject {
         runPhaseEvents = db.fetchRunPhaseEvents(runId: id)
         screenSnapshots = db.fetchScreenSnapshots(runId: id)
         actionEvents = db.fetchActionEvents(runId: id)
+
+        // Rebuild coverage nodes from screen snapshots
+        var uniqueScreens: [String: Int] = [:]
+        for s in screenSnapshots {
+            let name = s.screenClassification ?? "Unknown"
+            uniqueScreens[name, default: 0] += 1
+        }
+        let sorted = uniqueScreens.keys.sorted()
+        let gridColumns = max(1, Int(ceil(sqrt(Double(sorted.count)))))
+        coverageNodes = sorted.enumerated().map { (i, name) in
+            let row = i / gridColumns
+            let col = i % gridColumns
+            return CoverageNode(
+                id: "node-\(name.hashValue)",
+                name: name,
+                coveragePercent: 100,
+                status: .visited,
+                position: CGPoint(x: CGFloat(col) * 200 + 100, y: CGFloat(row) * 150 + 80),
+                connections: []
+            )
+        }
     }
 
     func selectFinding(_ id: String) {
@@ -161,10 +196,13 @@ final class AppState: ObservableObject {
                         Task { @MainActor in
                             self?.currentPhase = phase
                             self?.currentPhaseDetail = detail
-                            // Update the run in the list
+                            // Update the run in the list and persist to DB
                             if let index = self?.runs.firstIndex(where: { $0.id == runId }) {
                                 self?.runs[index].phase = phase
                                 self?.runs[index].status = phase == .completed ? .completed : (phase == .failed ? .failed : .exploring)
+                                if let updatedRun = self?.runs[index] {
+                                    self?.db.updateRun(updatedRun)
+                                }
                             }
                         }
                     }

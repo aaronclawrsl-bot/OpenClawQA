@@ -1,7 +1,56 @@
 import SwiftUI
 
+// MARK: - Persistent Settings Manager
+final class AppSettings: ObservableObject {
+    static let shared = AppSettings()
+
+    @Published var notifyOnRunComplete: Bool {
+        didSet { UserDefaults.standard.set(notifyOnRunComplete, forKey: "notifyOnRunComplete") }
+    }
+    @Published var notifyOnCriticalFinding: Bool {
+        didSet { UserDefaults.standard.set(notifyOnCriticalFinding, forKey: "notifyOnCriticalFinding") }
+    }
+    @Published var notifyOnBuildFailure: Bool {
+        didSet { UserDefaults.standard.set(notifyOnBuildFailure, forKey: "notifyOnBuildFailure") }
+    }
+    @Published var dailyDigest: Bool {
+        didSet { UserDefaults.standard.set(dailyDigest, forKey: "dailyDigest") }
+    }
+    @Published var keepVideosForFailedOnly: Bool {
+        didSet { UserDefaults.standard.set(keepVideosForFailedOnly, forKey: "keepVideosForFailedOnly") }
+    }
+    @Published var verboseLogging: Bool {
+        didSet { UserDefaults.standard.set(verboseLogging, forKey: "verboseLogging") }
+    }
+    @Published var includeAccessibilitySnapshots: Bool {
+        didSet { UserDefaults.standard.set(includeAccessibilitySnapshots, forKey: "includeAccessibilitySnapshots") }
+    }
+
+    private init() {
+        let defaults = UserDefaults.standard
+        // Register defaults for first launch
+        defaults.register(defaults: [
+            "notifyOnRunComplete": true,
+            "notifyOnCriticalFinding": true,
+            "notifyOnBuildFailure": true,
+            "dailyDigest": false,
+            "keepVideosForFailedOnly": false,
+            "verboseLogging": false,
+            "includeAccessibilitySnapshots": true
+        ])
+        self.notifyOnRunComplete = defaults.bool(forKey: "notifyOnRunComplete")
+        self.notifyOnCriticalFinding = defaults.bool(forKey: "notifyOnCriticalFinding")
+        self.notifyOnBuildFailure = defaults.bool(forKey: "notifyOnBuildFailure")
+        self.dailyDigest = defaults.bool(forKey: "dailyDigest")
+        self.keepVideosForFailedOnly = defaults.bool(forKey: "keepVideosForFailedOnly")
+        self.verboseLogging = defaults.bool(forKey: "verboseLogging")
+        self.includeAccessibilitySnapshots = defaults.bool(forKey: "includeAccessibilitySnapshots")
+    }
+}
+
 struct SettingsView: View {
     @EnvironmentObject var appState: AppState
+    @StateObject private var settings = AppSettings.shared
     @State private var selectedSection: String = "General"
     @State private var projectName: String = ""
     @State private var defaultEnvironment: String = ""
@@ -9,6 +58,11 @@ struct SettingsView: View {
     @State private var autoStartOnCommit: Bool = true
     @State private var compareAgainstPrevious: Bool = true
     @State private var generateAIDescriptions: Bool = true
+
+    // Credential editing state
+    @State private var editingCredentialKey: String?
+    @State private var credentialEditValue: String = ""
+    @State private var storedCredentialKeys: [String] = []
 
     let sections = ["General", "Project", "Environments", "AI & Analysis", "Notifications", "Integrations", "Team", "Advanced"]
 
@@ -147,40 +201,51 @@ struct SettingsView: View {
                     .font(AppFont.heading(16))
                     .foregroundColor(AppColors.textPrimary)
 
-                HStack {
-                    Text("TEST_EMAIL")
-                        .font(AppFont.mono(12))
-                        .foregroundColor(AppColors.textSecondary)
-                    Spacer()
-                    Text("••••••••")
-                        .font(AppFont.mono(12))
-                        .foregroundColor(AppColors.textTertiary)
-                    Button("Edit") {}
-                        .font(AppFont.caption())
-                        .foregroundColor(AppColors.accentBlue)
-                        .buttonStyle(.plain)
-                }
-                .padding(AppSpacing.md)
-                .background(AppColors.inputBackground)
-                .cornerRadius(6)
+                credentialRow("TEST_EMAIL")
+                credentialRow("TEST_PASSWORD")
 
-                HStack {
-                    Text("TEST_PASSWORD")
-                        .font(AppFont.mono(12))
-                        .foregroundColor(AppColors.textSecondary)
-                    Spacer()
-                    Text("••••••••")
-                        .font(AppFont.mono(12))
-                        .foregroundColor(AppColors.textTertiary)
-                    Button("Edit") {}
-                        .font(AppFont.caption())
-                        .foregroundColor(AppColors.accentBlue)
-                        .buttonStyle(.plain)
+                // Inline editor
+                if let key = editingCredentialKey {
+                    VStack(alignment: .leading, spacing: AppSpacing.sm) {
+                        Text("Edit \(key)")
+                            .font(AppFont.subheading(12))
+                            .foregroundColor(AppColors.textPrimary)
+                        HStack {
+                            SecureField("Enter value", text: $credentialEditValue)
+                                .textFieldStyle(.plain)
+                                .font(AppFont.mono(12))
+                                .foregroundColor(AppColors.textPrimary)
+                                .padding(AppSpacing.sm)
+                                .background(AppColors.inputBackground)
+                                .cornerRadius(4)
+                            Button("Save") {
+                                let _ = KeychainService.shared.save(key: key, value: credentialEditValue)
+                                credentialEditValue = ""
+                                editingCredentialKey = nil
+                                storedCredentialKeys = KeychainService.shared.listKeys()
+                            }
+                            .font(AppFont.subheading(12))
+                            .foregroundColor(.white)
+                            .padding(.horizontal, AppSpacing.md)
+                            .padding(.vertical, 6)
+                            .background(AppColors.accentBlue)
+                            .cornerRadius(6)
+                            .buttonStyle(.plain)
+                            Button("Cancel") {
+                                credentialEditValue = ""
+                                editingCredentialKey = nil
+                            }
+                            .font(AppFont.subheading(12))
+                            .foregroundColor(AppColors.textSecondary)
+                            .buttonStyle(.plain)
+                        }
+                    }
+                    .padding(AppSpacing.md)
+                    .background(AppColors.cardBackground)
+                    .cornerRadius(6)
                 }
-                .padding(AppSpacing.md)
-                .background(AppColors.inputBackground)
-                .cornerRadius(6)
             }
+            .onAppear { storedCredentialKeys = KeychainService.shared.listKeys() }
         }
     }
 
@@ -231,10 +296,10 @@ struct SettingsView: View {
     // MARK: - Notification Settings
     private var notificationSettings: some View {
         VStack(spacing: AppSpacing.xl) {
-            settingsToggle("Notify on run complete", isOn: .constant(true))
-            settingsToggle("Notify on critical finding", isOn: .constant(true))
-            settingsToggle("Notify on build failure", isOn: .constant(true))
-            settingsToggle("Daily digest email", isOn: .constant(false))
+            settingsToggle("Notify on run complete", isOn: $settings.notifyOnRunComplete)
+            settingsToggle("Notify on critical finding", isOn: $settings.notifyOnCriticalFinding)
+            settingsToggle("Notify on build failure", isOn: $settings.notifyOnBuildFailure)
+            settingsToggle("Daily digest email", isOn: $settings.dailyDigest)
 
             Divider().background(AppColors.border)
 
@@ -272,13 +337,13 @@ struct SettingsView: View {
     private var advancedSettings: some View {
         VStack(spacing: AppSpacing.xl) {
             settingsDropdown("Artifact Retention", value: "30 days")
-            settingsToggle("Keep videos for failed runs only", isOn: .constant(false))
+            settingsToggle("Keep videos for failed runs only", isOn: $settings.keepVideosForFailedOnly)
 
             Divider().background(AppColors.border)
 
             settingsDropdown("Derived Data Mode", value: "Isolated")
-            settingsToggle("Verbose logging", isOn: .constant(false))
-            settingsToggle("Include accessibility snapshots in artifacts", isOn: .constant(true))
+            settingsToggle("Verbose logging", isOn: $settings.verboseLogging)
+            settingsToggle("Include accessibility snapshots in artifacts", isOn: $settings.includeAccessibilitySnapshots)
 
             Divider().background(AppColors.border)
 
@@ -380,6 +445,38 @@ struct SettingsView: View {
                 .toggleStyle(.switch)
                 .tint(AppColors.accentBlue)
         }
+    }
+
+    private func credentialRow(_ key: String) -> some View {
+        let hasValue = storedCredentialKeys.contains(key)
+        return HStack {
+            Text(key)
+                .font(AppFont.mono(12))
+                .foregroundColor(AppColors.textSecondary)
+            Spacer()
+            Text(hasValue ? "••••••••" : "Not set")
+                .font(AppFont.mono(12))
+                .foregroundColor(hasValue ? AppColors.textTertiary : AppColors.warning)
+            Button("Edit") {
+                editingCredentialKey = key
+                credentialEditValue = ""
+            }
+            .font(AppFont.caption())
+            .foregroundColor(AppColors.accentBlue)
+            .buttonStyle(.plain)
+            if hasValue {
+                Button("Clear") {
+                    let _ = KeychainService.shared.delete(key: key)
+                    storedCredentialKeys = KeychainService.shared.listKeys()
+                }
+                .font(AppFont.caption())
+                .foregroundColor(AppColors.error)
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(AppSpacing.md)
+        .background(AppColors.inputBackground)
+        .cornerRadius(6)
     }
 
     private func availableSimulators() -> [String] {

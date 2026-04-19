@@ -596,7 +596,15 @@ class ExplorerTests: XCTestCase {
 
         if isTextField(element.type) {
             coord.tap()
-            Thread.sleep(forTimeInterval: 0.3)
+            Thread.sleep(forTimeInterval: 0.5)
+
+            // Check if keyboard appeared — if not, the field didn't gain focus
+            let keyboard = app.keyboards.firstMatch
+            guard keyboard.waitForExistence(timeout: 1.0) else {
+                let name = element.identifier.isEmpty ? element.label : element.identifier
+                return "tap(\(name))_no_keyboard"
+            }
+
             let hint = (element.identifier + " " + element.label).lowercased()
             let testText: String
             if hint.contains("email") || hint.contains("e-mail") {
@@ -617,7 +625,7 @@ class ExplorerTests: XCTestCase {
             if let xcEl = element.xcElement, xcEl.exists {
                 xcEl.typeText(testText)
             } else {
-                // Snapshot-based element — resolve text field for typing
+                // Snapshot-based element — find the field closest to where we tapped
                 let resolved: XCUIElement? = {
                     if !element.identifier.isEmpty {
                         let tf = app.textFields[element.identifier]
@@ -625,14 +633,25 @@ class ExplorerTests: XCTestCase {
                         let stf = app.secureTextFields[element.identifier]
                         if stf.exists { return stf }
                     }
-                    // Fallback: try the first focused text field
-                    let tf = app.textFields.firstMatch
-                    if tf.exists { return tf }
-                    let stf = app.secureTextFields.firstMatch
-                    if stf.exists { return stf }
-                    return nil
+                    let allTextFields = app.textFields.allElementsBoundByIndex + app.secureTextFields.allElementsBoundByIndex
+                    let tapped = CGPoint(x: frame.midX, y: frame.midY)
+                    let closest = allTextFields
+                        .filter { $0.exists && $0.frame.width > 0 }
+                        .min(by: {
+                            let d1 = abs($0.frame.midX - tapped.x) + abs($0.frame.midY - tapped.y)
+                            let d2 = abs($1.frame.midX - tapped.x) + abs($1.frame.midY - tapped.y)
+                            return d1 < d2
+                        })
+                    return closest
                 }()
-                resolved?.typeText(testText)
+                if let resolved = resolved {
+                    resolved.tap()
+                    Thread.sleep(forTimeInterval: 0.3)
+                    // Verify keyboard is still present before typing
+                    if keyboard.exists {
+                        resolved.typeText(testText)
+                    }
+                }
             }
             let name = element.identifier.isEmpty ? element.label : element.identifier
             return "type(\(name), \"\(testText)\")"

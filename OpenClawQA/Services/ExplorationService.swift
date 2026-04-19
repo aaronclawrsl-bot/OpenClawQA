@@ -70,13 +70,13 @@ final class ExplorationService {
             "-project", harnessDir + "/OCQAHarness.xcodeproj",
             "-scheme", "OCQAHarnessUITests",
             "-destination", "platform=iOS Simulator,name=\(simulator)",
-            "-derivedDataPath", harnessDerivedData,
-            "-quiet"
+            "-derivedDataPath", harnessDerivedData
         ])
 
         let success = result?.contains("BUILD SUCCEEDED") == true ||
                        result?.contains("** BUILD SUCCEEDED **") == true ||
-                       (result != nil && !result!.contains("BUILD FAILED"))
+                       result?.contains("** TEST BUILD SUCCEEDED **") == true ||
+                       (result != nil && !result!.contains("BUILD FAILED") && !result!.contains("error:"))
         return (success, result ?? "No output")
     }
 
@@ -153,7 +153,8 @@ final class ExplorationService {
         process.standardError = errPipe
         process.environment = ProcessInfo.processInfo.environment
 
-        // Buffer for line-based parsing
+        // Thread-safe parsing: all mutations happen on this serial queue
+        let parseQueue = DispatchQueue(label: "com.openclaw.exploration.parse")
         var lineBuffer = ""
         var stepIndex = 0
         var currentScreenTitle = "Unknown"
@@ -166,26 +167,28 @@ final class ExplorationService {
             guard !data.isEmpty else { return }
             guard let chunk = String(data: data, encoding: .utf8) else { return }
 
-            allOutput += chunk
-            lineBuffer += chunk
+            parseQueue.sync {
+                allOutput += chunk
+                lineBuffer += chunk
 
-            while let newlineRange = lineBuffer.range(of: "\n") {
-                let line = String(lineBuffer[lineBuffer.startIndex..<newlineRange.lowerBound])
-                lineBuffer = String(lineBuffer[newlineRange.upperBound...])
+                while let newlineRange = lineBuffer.range(of: "\n") {
+                    let line = String(lineBuffer[lineBuffer.startIndex..<newlineRange.lowerBound])
+                    lineBuffer = String(lineBuffer[newlineRange.upperBound...])
 
-                self.parseLine(
-                    line, projectId: projectId, runId: runId,
-                    stepIndex: &stepIndex,
-                    currentScreenTitle: &currentScreenTitle,
-                    currentHash: &currentHash,
-                    findings: &findings, snapshots: &snapshots,
-                    actionEvents: &actionEvents, transitions: &transitions,
-                    screenNames: &screenNames, screenHashes: &screenHashes,
-                    actionsPerformed: &actionsPerformed,
-                    statesDiscovered: &statesDiscovered,
-                    artifactDir: artifactDir,
-                    onProgress: onProgress
-                )
+                    self.parseLine(
+                        line, projectId: projectId, runId: runId,
+                        stepIndex: &stepIndex,
+                        currentScreenTitle: &currentScreenTitle,
+                        currentHash: &currentHash,
+                        findings: &findings, snapshots: &snapshots,
+                        actionEvents: &actionEvents, transitions: &transitions,
+                        screenNames: &screenNames, screenHashes: &screenHashes,
+                        actionsPerformed: &actionsPerformed,
+                        statesDiscovered: &statesDiscovered,
+                        artifactDir: artifactDir,
+                        onProgress: onProgress
+                    )
+                }
             }
         }
 
@@ -194,7 +197,9 @@ final class ExplorationService {
             let data = handle.availableData
             guard !data.isEmpty else { return }
             if let chunk = String(data: data, encoding: .utf8) {
-                allOutput += chunk
+                parseQueue.sync {
+                    allOutput += chunk
+                }
             }
         }
 
@@ -202,11 +207,21 @@ final class ExplorationService {
             try process.run()
             process.waitUntilExit()
         } catch {
-            allOutput += "\nProcess launch failed: \(error.localizedDescription)"
+            parseQueue.sync {
+                allOutput += "\nProcess launch failed: \(error.localizedDescription)"
+            }
         }
 
         outPipe.fileHandleForReading.readabilityHandler = nil
         errPipe.fileHandleForReading.readabilityHandler = nil
+
+        // Drain any remaining data in pipes
+        if let remaining = String(data: outPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8), !remaining.isEmpty {
+            parseQueue.sync { allOutput += remaining }
+        }
+        if let remaining = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8), !remaining.isEmpty {
+            parseQueue.sync { allOutput += remaining }
+        }
 
         // Save exploration log
         let logPath = artifactDir + "/exploration.log"
@@ -395,34 +410,26 @@ final class ExplorationService {
         let screenshotDir = outputDir + "/screenshots"
         try? FileManager.default.createDirectory(atPath: screenshotDir, withIntermediateDirectories: true)
 
-        // Use xcresulttool to list attachments
-        let listResult = await runner.runShellCommand("xcrun", arguments: [
-            "xcresulttool", "get", "--format", "json",
-            "--path", xcresultPath
+        // Export all attachments from xcresult
+        _ = await runner.runShellCommand("xcrun", arguments: [
+            "xcresulttool", "export", "attachments",
+            "--path", xcresultPath,
+            "--output-path", screenshotDir
         ])
 
-        guard let listResult = listResult else { return }
-
-        // Extract test attachment references
-        // xcresulttool output is complex nested JSON; extract attachment IDs
-        if let data = listResult.data(using: .utf8),
-           let _ = try? JSONSerialization.jsonObject(with: data) {
-            // For each snapshot that doesn't have a screenshot path, try to extract
-            // The attachments are named "state_N_ScreenName"
-            let exportResult = await runner.runShellCommand("xcrun", arguments: [
-                "xcresulttool", "export",
-                "--type", "file",
-                "--path", xcresultPath,
-                "--output-path", screenshotDir
+        // Parse manifest.json to match screenshots to steps
+        let manifestPath = screenshotDir + "/manifest.json"
+        guard FileManager.default.fileExists(atPath: manifestPath),
+              let manifestData = FileManager.default.contents(atPath: manifestPath),
+              let manifestArray = try? JSONSerialization.jsonObject(with: manifestData) as? [[String: Any]],
+              let firstEntry = manifestArray.first,
+              let attachments = firstEntry["attachments"] as? [[String: Any]] else {
+            // Fallback: just find PNG files and match by index
+            let findResult = await runner.runShellCommand("find", arguments: [
+                screenshotDir, "-name", "*.png"
             ])
-
-            // Find extracted PNG files
-            let extractedFiles = await runner.runShellCommand("find", arguments: [
-                screenshotDir, "-name", "*.png", "-o", "-name", "*.jpg"
-            ])
-            if let files = extractedFiles {
+            if let files = findResult {
                 let paths = files.components(separatedBy: "\n").filter { !$0.isEmpty }.sorted()
-                // Match screenshots to snapshots by index
                 for (i, path) in paths.enumerated() where i < snapshots.count {
                     snapshots[i] = ScreenSnapshot(
                         id: snapshots[i].id, runId: snapshots[i].runId,
@@ -435,6 +442,72 @@ final class ExplorationService {
                         parentSnapshotId: snapshots[i].parentSnapshotId
                     )
                 }
+            }
+            return
+        }
+
+        // Build a map from step index to screenshot path using suggestedHumanReadableName
+        // Format: "state_{step}_{screenName}_{...}.png" or "final_state_{...}.png"
+        struct AttachmentInfo {
+            let stepIndex: Int
+            let screenName: String
+            let filePath: String
+            let timestamp: Double
+        }
+
+        var attachmentInfos: [AttachmentInfo] = []
+        for att in attachments {
+            guard let exportedFile = att["exportedFileName"] as? String,
+                  let suggestedName = att["suggestedHumanReadableName"] as? String else { continue }
+            let fullPath = screenshotDir + "/" + exportedFile
+            guard FileManager.default.fileExists(atPath: fullPath) else { continue }
+            let ts = att["timestamp"] as? Double ?? 0
+
+            // Parse "state_N_ScreenName_..." pattern
+            // xcresulttool exports as: state_{step}_{screenName}_{exportIndex}_{UUID}.png
+            if suggestedName.hasPrefix("state_") {
+                let parts = suggestedName.dropFirst("state_".count).components(separatedBy: "_")
+                if let stepIdx = Int(parts.first ?? "") {
+                    var screenParts = Array(parts.dropFirst().dropLast()) // drop step number and UUID.png suffix
+                    // Drop trailing export index (xcresulttool adds _N before UUID)
+                    if let last = screenParts.last, Int(last) != nil {
+                        screenParts = Array(screenParts.dropLast())
+                    }
+                    let screenName = screenParts.joined(separator: " ")
+                    attachmentInfos.append(AttachmentInfo(stepIndex: stepIdx, screenName: screenName, filePath: fullPath, timestamp: ts))
+                }
+            } else if suggestedName.hasPrefix("final_state_") {
+                // Final state screenshot — assign to the last step
+                let maxStep = snapshots.map(\.stepIndex).max() ?? 0
+                attachmentInfos.append(AttachmentInfo(stepIndex: maxStep + 1, screenName: "Final State", filePath: fullPath, timestamp: ts))
+            }
+        }
+
+        // Sort by step index
+        attachmentInfos.sort { $0.stepIndex < $1.stepIndex }
+
+        // Match to snapshots by step index
+        for info in attachmentInfos {
+            if let idx = snapshots.firstIndex(where: { $0.stepIndex == info.stepIndex }) {
+                snapshots[idx] = ScreenSnapshot(
+                    id: snapshots[idx].id, runId: snapshots[idx].runId,
+                    stepIndex: snapshots[idx].stepIndex,
+                    timestamp: snapshots[idx].timestamp,
+                    screenFingerprint: snapshots[idx].screenFingerprint,
+                    screenshotPath: info.filePath,
+                    accessibilityTreeJson: snapshots[idx].accessibilityTreeJson,
+                    screenClassification: info.screenName.isEmpty ? snapshots[idx].screenClassification : info.screenName,
+                    parentSnapshotId: snapshots[idx].parentSnapshotId
+                )
+            } else if info.stepIndex > 0 {
+                // Add as new snapshot (e.g., final state)
+                snapshots.append(ScreenSnapshot(
+                    id: UUID().uuidString, runId: runId,
+                    stepIndex: info.stepIndex, timestamp: Date(),
+                    screenFingerprint: "extracted",
+                    screenshotPath: info.filePath,
+                    screenClassification: info.screenName
+                ))
             }
         }
     }

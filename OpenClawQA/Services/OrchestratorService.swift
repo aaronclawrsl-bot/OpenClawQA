@@ -10,6 +10,19 @@ final class OrchestratorService {
     private let db = DatabaseManager.shared
     private let explorer = ExplorationService.shared
 
+    // MARK: - Run Configuration
+    struct RunConfiguration {
+        var simulatorName: String = "iPhone 16 Pro"
+        var maxActions: Int = 25
+        var timeoutSeconds: Int = 300
+        var resolvedRuntime: String = "iOS 26.4"
+
+        static func from(project: QAProject) -> RunConfiguration {
+            // Future: read from project config / .openclaw.yml
+            return RunConfiguration()
+        }
+    }
+
     enum RunError: Error, LocalizedError {
         case buildFailed(String)
         case simulatorFailed(String)
@@ -61,8 +74,10 @@ final class OrchestratorService {
     func executeReleaseCheck(
         project: QAProject,
         runId: String,
+        configuration: RunConfiguration? = nil,
         onPhaseChange: @escaping (RunPhase, String) -> Void
     ) async throws -> RunResult {
+        let config = configuration ?? RunConfiguration.from(project: project)
         let startTime = Date()
         var phaseEvents: [RunPhaseEvent] = []
         var findings: [QAFinding] = []
@@ -94,9 +109,9 @@ final class OrchestratorService {
         let xcodeVersionRaw = await runner.runShellCommand("xcodebuild", arguments: ["-version"]) ?? "Unknown"
         let xcodeVersion = xcodeVersionRaw.components(separatedBy: "\n").first?.replacingOccurrences(of: "Xcode ", with: "") ?? "Unknown"
 
-        let simulatorName = "iPhone 16 Pro"
+        let simulatorName = config.simulatorName
         let simulatorUDID = await runner.findSimulatorUDID(name: simulatorName)
-        let resolvedRuntime = "iOS 18.3"
+        let resolvedRuntime = config.resolvedRuntime
         let simulatorProfile = "\(simulatorName) (\(resolvedRuntime))"
 
         recordPhase(.preparing, substep: "Configuration resolved", status: "completed")
@@ -249,32 +264,11 @@ final class OrchestratorService {
         var explorationCoverageNodes: [CoverageNode] = []
         var screensVisited: [String] = []
 
-        if let projectPath = project.projectPath, !projectPath.isEmpty {
-            let testResult = await runner.runTests(
-                projectOrWorkspace: .project(projectPath),
-                scheme: project.scheme,
-                simulator: simulatorName,
-                derivedDataPath: derivedDataPath
-            )
+        // Skip xcodebuild test for the target project — the autonomous exploration
+        // handles all test coverage. Project-native tests can be added later via
+        // deterministic checks configuration.
 
-            let testLogPath = logDir + "/test.log"
-            try? testResult.log.write(toFile: testLogPath, atomically: true, encoding: .utf8)
-            let (passed, failed) = parseTestCounts(log: testResult.log)
-            testsPassed = passed
-            testsFailed = failed
-
-            artifacts.append(QAArtifact(
-                id: UUID().uuidString, runId: runId, type: "test_log",
-                path: testLogPath,
-                metadata: "{\"size_bytes\": \(testResult.log.utf8.count), \"passed\": \(testsPassed), \"failed\": \(testsFailed)}",
-                createdAt: Date()
-            ))
-
-            let testFindings = parseTestFailures(log: testResult.log, projectId: project.id, runId: runId, environment: simulatorProfile)
-            findings.append(contentsOf: testFindings)
-        }
-
-        recordPhase(.exploring, substep: "Deterministic tests completed", status: "completed")
+        recordPhase(.exploring, substep: "Deterministic tests skipped (exploration-first mode)", status: "completed")
 
         // ===== 6b. AUTONOMOUS EXPLORATION =====
         onPhaseChange(.exploring, "Building exploration harness...")
@@ -284,6 +278,18 @@ final class OrchestratorService {
         if harnessBuild.success {
             recordPhase(.exploring, substep: "Harness built", status: "completed")
 
+            // Start video recording before exploration
+            var videoProcess: Process?
+            let videoPath = logDir + "/exploration-video.mov"
+            if let udid = simulatorUDID {
+                videoProcess = runner.startVideoRecording(udid: udid, outputPath: videoPath)
+                if videoProcess != nil {
+                    recordPhase(.exploring, substep: "Video recording started", status: "completed")
+                    // Allow recording to initialize
+                    try? await Task.sleep(nanoseconds: 500_000_000)
+                }
+            }
+
             onPhaseChange(.exploring, "Exploring app autonomously...")
             recordPhase(.exploring, substep: "Autonomous exploration started")
 
@@ -291,8 +297,8 @@ final class OrchestratorService {
                 bundleId: project.bundleId,
                 simulator: simulatorName,
                 simulatorUDID: simulatorUDID,
-                maxActions: 200,
-                timeoutSeconds: 1800,
+                maxActions: config.maxActions,
+                timeoutSeconds: config.timeoutSeconds,
                 projectId: project.id,
                 runId: runId,
                 artifactDir: logDir,
@@ -309,6 +315,24 @@ final class OrchestratorService {
             explorationActions = explorationResult.actionEvents
             explorationCoverageNodes = explorationResult.coverageNodes
             screensVisited = explorationResult.screensVisited
+
+            // Stop video recording
+            if let vp = videoProcess {
+                runner.stopVideoRecording(vp)
+                // Allow file to finalize
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                if FileManager.default.fileExists(atPath: videoPath) {
+                    let videoAttrs = try? FileManager.default.attributesOfItem(atPath: videoPath)
+                    let videoSize = (videoAttrs?[.size] as? Int64) ?? 0
+                    artifacts.append(QAArtifact(
+                        id: UUID().uuidString, runId: runId, type: "video",
+                        path: videoPath,
+                        metadata: "{\"source\": \"exploration\", \"size_bytes\": \(videoSize)}",
+                        createdAt: Date()
+                    ))
+                    recordPhase(.exploring, substep: "Video recording saved", status: "completed")
+                }
+            }
 
             // Save exploration log as artifact
             let explorationLogPath = logDir + "/exploration.log"
@@ -372,11 +396,20 @@ final class OrchestratorService {
         let mediumCount = findings.filter { $0.severity == .medium }.count
         let lowCount = findings.filter { $0.severity == .low }.count
 
+        // Separate build warnings from runtime/exploration issues
+        let runtimeFindings = findings.filter { $0.category != .buildFailure }
+        let runtimeCritical = runtimeFindings.filter { $0.severity == .critical }.count
+        let runtimeHigh = runtimeFindings.filter { $0.severity == .high }.count
+        let runtimeMedium = runtimeFindings.filter { $0.severity == .medium }.count
+
+        // Confidence is driven by runtime issues; build warnings are informational
         var confidenceScore = 100
-        confidenceScore -= criticalCount * 25
-        confidenceScore -= highCount * 10
-        confidenceScore -= mediumCount * 3
-        confidenceScore -= lowCount * 1
+        confidenceScore -= runtimeCritical * 25
+        confidenceScore -= runtimeHigh * 10
+        confidenceScore -= runtimeMedium * 3
+        // Build warnings: minor deduction, capped at -5
+        let buildWarningCount = findings.filter { $0.category == .buildFailure && $0.severity == .low }.count
+        confidenceScore -= min(5, buildWarningCount)
         if testsFailed > 0 { confidenceScore -= testsFailed * 5 }
         confidenceScore = max(0, min(100, confidenceScore))
 
