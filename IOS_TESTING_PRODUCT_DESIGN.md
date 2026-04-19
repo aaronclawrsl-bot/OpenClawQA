@@ -23,13 +23,15 @@ The initial product is **macOS desktop first**, not browser first.
 
 - **Repo**: `aaronclawrsl-bot/OpenClawQA` on GitHub (private)
 - **Local (Linux build server)**: `/home/aaron/repos/OpenClawQA`
-- **Local (Mac runner)**: `~/repos/OpenClawQA` on `taylorolsen-vogt@100.125.133.123` (Tailscale IP)
+- **Local (Mac runner)**: `/Users/aarwitz/repos/OpenClawQA` on `aarwitz@100.70.115.12` (Tailscale IP)
 - **Branch**: `main` (only branch)
 - **Commits** (oldest → newest):
   1. `0d1d624` — SwiftUI desktop app: full UI, 11 views, SQLite DB, models, services
   2. `afd41a7` — Remove all mock data, wire real xcodebuild/simctl backend pipeline
   3. `c71fbb1` — Wire autonomous exploration harness into the full orchestration pipeline
   4. `07af7c5` — Generalize explorer: snapshot-based tree reading (~60x faster), persistent-nav detection, depth-first prioritization, remove all app-specific code
+  5. `bb81ad9` — Mac agent improvements: video recording, thread-safe DB, xcresult extraction, RunConfiguration defaults, text field fixes
+  6. `e5dac12` — Add `scripts/quick-capture.sh`, rewrite `deploy-and-build.sh` for local Mac use
 
 ### What Is Built (22 Swift files + 1 harness test file)
 
@@ -54,21 +56,23 @@ The full release check pipeline runs:
 2. `xcodebuild build-for-testing` with isolated derived data
 3. `xcrun simctl boot` + `simctl install` + launch screenshot
 4. ExplorationService deploys the OCQAHarness XCUITest, parses OCQA_ protocol output in real-time
-5. Findings classified (crash, dead_end, navigation_loop, build_failure, etc.)
-6. Confidence score computed: `100 - (critical×25 + high×10 + medium×3 + low×1)`
-7. Release readiness: ready (≥70) / caution (40–69) / blocked (<40)
-8. All artifacts persisted to SQLite + local filesystem
+5. Per-action screenshots extracted from `.xcresult` and mapped back to exploration steps
+6. Run-level video recorded via `simctl io recordVideo` and stored as a `video` artifact
+7. Findings classified (crash, dead_end, navigation_loop, build_failure, etc.)
+8. Confidence score computed from runtime findings, with build warnings treated as informational/minor deductions
+9. Release readiness: ready (≥70) / caution (40–69) / blocked (<40)
+10. All artifacts persisted to SQLite + local filesystem
 
 ### What Does NOT Work Yet
 
 | Gap | Detail |
 |-----|--------|
 | **Visual regression** | Screenshots captured per-action in xcresult, but no baseline diffing system exists |
-| **Video recording** | RunDetailView video area is a placeholder. See "Visual Media Acquisition" section below for the chosen approach |
+| **Video UX** | Run-level video is recorded and loaded into RunDetailView, but there are no finding timeline markers, jumps-to-timestamp, or export/upload flows yet |
 | **Integration OAuth** | GitHub/Jira/Slack UI cards exist but Configure buttons are no-ops |
 | **Keychain UI** | KeychainService exists but Settings > Test Credentials buttons are stubs |
 | **Notification persistence** | Settings toggles use `.constant()` bindings — changes not saved |
-| **OrchestratorService hardcodes** | `simulatorName = "iPhone 16 Pro"`, `maxActions: 200`, `timeoutSeconds: 1800` — should come from project config |
+| **OrchestratorService defaults** | `RunConfiguration` exists, but `RunConfiguration.from(project:)` still returns defaults (`iPhone 16 Pro`, 25 actions, 300s, `iOS 26.4`) instead of reading project config |
 
 ### Critical Performance Finding: Snapshot-Based Tree Reading
 
@@ -1638,14 +1642,34 @@ For full motion video or on-demand screenshot acquisition of specific screens, u
 
 ### Purpose and Architecture
 
-The project has a proven visual capture pipeline at `~/.openclaw/scripts/ewag-capture.sh` that handles screenshot and video recording via a Mac-hosted iOS agent. This system is the **chosen approach** for acquiring real rendered media when the automation needs it — not for routine per-action screenshots (those come from XCTest attachments) but for **targeted, high-fidelity captures** in specific situations:
+The project now has **two distinct media acquisition paths** and the next agent must not conflate them:
+
+1. **Repo-local Mac capture**: `scripts/quick-capture.sh` inside OpenClawQA. This is the fastest path when the agent is already running on the Mac. It uses `simctl`, the existing harness, `xcresulttool`, and local ffmpeg without any SSH hop.
+2. **Gateway-side capture**: `~/.openclaw/scripts/ewag-capture.sh` on the Linux/OpenClaw gateway. This is still useful when captures must be initiated remotely or uploaded into the existing Drive-based artifact flow.
+
+For the Mac-local agent, `quick-capture.sh` and direct `simctl`/xcresult usage are the default tools for rapid screenshot and recording acquisition. `ewag-capture.sh` is not required for ordinary local development.
+
+The capture system is meant for **targeted, high-fidelity captures** in specific situations, not for routine per-action screenshots (those already come from XCTest attachments):
 
 1. **When the explorer gets stuck on ambiguous UI**: If the engine hits a navigation loop or dead-end and cannot determine what the screen actually looks like, it can request a real screenshot for diagnosis or human review.
 2. **When visual regression detection needs a clean baseline**: Screenshot diffs require pixel-accurate captures at consistent states, not mid-transition XCTest snapshots.
 3. **When aesthetic or layout feedback is needed**: For findings classified as `layout_overlap`, `text_clipping`, `blank_screen`, or `visual_regression`, attaching a real rendered screenshot or short video is more valuable than accessibility metadata alone.
 4. **For run-level summary recordings**: A full-run screen recording (start before exploration, stop after) gives the user a video replay of exactly what happened.
 
-### How ewag-capture.sh Works
+### How the Capture Paths Work
+
+#### Mac-local: quick-capture.sh
+
+The repo-local helper at `scripts/quick-capture.sh` provides four fast commands:
+
+- `quick-capture.sh screenshot` — instant screenshot of the booted simulator via `simctl io screenshot`
+- `quick-capture.sh record --duration N` — local simulator recording via `simctl io recordVideo`, converted to WebM with ffmpeg
+- `quick-capture.sh explore <bundleId> --actions N` — runs the harness, records run-level video, extracts per-action screenshots from `.xcresult`, stores all artifacts under `captures/<timestamp>/`
+- `quick-capture.sh tree <bundleId>` — runs `testDumpUITree` and saves the emitted accessibility tree JSON
+
+This is the preferred rapid-feedback tool when the agent is on the Mac.
+
+#### Gateway-side: ewag-capture.sh
 
 The script orchestrates captures via SSH to the Mac runner:
 
@@ -1654,23 +1678,30 @@ The script orchestrates captures via SSH to the Mac runner:
 - **Scroll mode**: Runs a scroll-through test case, records the scrolling, trims the lead-in, converts to WebM.
 
 Key infrastructure facts:
-- Mac runner: `taylorolsen-vogt@100.125.133.123` (Tailscale)
-- ios-agent binary: `/Users/taylorolsen-vogt/ios-agent/ios-agent`
-- Artifacts dir: `/Users/taylorolsen-vogt/ios-agent/artifacts/`
+- Mac runner for the current local setup: `aarwitz@100.70.115.12` (Tailscale)
+- Gateway remote-capture workflow still assumes an `ios-agent` binary on the target Mac
+- Local Mac workflow does **not** require SSH or `ios-agent`; it uses repo scripts and local Apple tooling directly
 - Google Drive upload via `gog drive upload` (OAuth configured)
-- ffmpeg on Linux host for MP4→WebM conversion
+- ffmpeg available on the Mac for local MP4/MOV→WebM conversion
 
 ### Integration Path for OpenClawQA
 
-The ExplorationService should be extended to support on-demand media acquisition:
+The current codebase already implements the core local-media path:
 
-1. **Run-level video**: Before calling `testAutonomousExploration`, optionally start `xcrun simctl io <UDID> recordVideo /tmp/ocqa-run-<runId>.mov`. After exploration completes, stop recording. Convert and store as run artifact. This is the simplest approach for full-run video.
+1. **Run-level video**: Implemented in `OrchestratorService` using `RunnerService.startVideoRecording()` / `stopVideoRecording()` around `testAutonomousExploration`. The resulting file is stored as a `video` artifact.
 
-2. **On-demand screenshot**: When the explorer detects a stuck state, dead-end, or visual finding, invoke `testScreenshot` (already implemented in ExplorerTests.swift) to capture a clean frame, or call `xcrun simctl io <UDID> screenshot` directly.
+2. **On-demand screenshot**: `testScreenshot` already exists in `ExplorerTests.swift`, and direct simulator screenshots are also available through `quick-capture.sh screenshot` or `xcrun simctl io <UDID> screenshot`.
 
-3. **Post-run screenshot extraction**: The xcresult bundle already contains per-action screenshots. ExplorationService.swift has `extractScreenshots(from:to:runId:snapshots:)` which calls `xcresulttool export attachments`. This is implemented but needs wiring to the artifact viewer in RunDetailView.
+3. **Post-run screenshot extraction**: Implemented in `ExplorationService.extractScreenshots(from:to:runId:snapshots:)` using `xcresulttool export attachments`, with manifest-based step matching.
 
-4. **Google Drive upload for shared artifacts**: For CI/CD or remote review scenarios, reuse ewag-capture.sh's Drive upload function (`gog drive upload`) to push findings screenshots to a shared folder.
+4. **Artifact viewing**: `RunDetailView` now loads `video` artifacts into an `AVPlayer`, so the video area is no longer just a placeholder.
+
+The remaining work is around richer playback UX, upload/export flows, and visual comparison:
+
+1. **Timeline-aware video UX**: finding markers, jump-to-time, and screenshot/video correlation in `RunDetailView`
+2. **On-demand screenshot at finding points**: trigger targeted capture only for ambiguous or high-value findings
+3. **Google Drive upload for shared artifacts**: reuse `ewag-capture.sh`-style upload logic for remote review if needed
+4. **Visual regression baselines**: pair stored screenshots by screen fingerprint and diff them across runs
 
 ### Important Design Constraint
 
@@ -1730,34 +1761,43 @@ Design queue and runner abstractions so future concurrency is possible, but do n
 ## Mac Runner Environment
 
 ### Current Setup
-- **Mac host**: `taylorolsen-vogt@100.125.133.123` (Tailscale IP)
-- **Xcode**: 16.x on macOS 14.5
-- **Simulators available**: iPhone 16 Pro (`CBF1BFB1`), iPhone 16 Pro Max (`13BE13C7`, iOS 18.3.1)
+- **Mac host**: `aarwitz@100.70.115.12` (Tailscale IP)
+- **Xcode**: 26.4
+- **Simulators available**: iPhone 16 Pro (`5540C184-7C6C-4930-A32A-5B27BC15CD57`, booted during inspection), plus additional shutdown devices as provisioned locally
 - **Git**: Can pull from GitHub, cannot push (no credential in osxkeychain). All pushes happen from the Linux build server.
-- **ios-agent**: `/Users/taylorolsen-vogt/ios-agent/ios-agent` — a separate binary for test execution and recording (used by ewag-capture.sh)
-- **App under test**: ResiLife (`com.elitepro.resilife`) at `~/repos/iosApp`
-- **Harness derived data**: `/tmp/ocqa-harness-dd` (used during development testing) and `~/Library/Application Support/OpenClawQA/HarnessDerivedData` (production path)
+- **ios-agent**: present on the Mac, but not required for OpenClawQA's local capture loop
+- **App under test**: ResiLife (`com.elitepro.resilife`) at `/Users/aarwitz/repos/EWAG-dev-iosApp`
+- **Harness derived data**: `/tmp/openclaw-qa-harness-derived`
+- **Repo-local helper scripts**:
+  - `scripts/deploy-and-build.sh` — local app/harness build helper
+  - `scripts/quick-capture.sh` — local screenshot / video / explore / tree helper
 
-### Running Tests from Linux (Current Development Workflow)
+### Running Tests from Linux (Gateway/Remote Workflow)
 
 ```bash
 # Write config and run exploration
-ssh taylorolsen-vogt@100.125.133.123 \
+ssh aarwitz@100.70.115.12 \
   "echo '{\"OCQA_BUNDLE_ID\":\"com.elitepro.resilife\",\"OCQA_MAX_ACTIONS\":\"25\",\"OCQA_TIMEOUT_SECONDS\":\"300\"}' > /tmp/ocqa-run-config.json && \
    xcodebuild test-without-building \
-     -project ~/repos/OpenClawQA/Harness/OCQAHarness.xcodeproj \
-     -scheme OCQAHarnessUITests \
-     -destination 'platform=iOS Simulator,id=13BE13C7-7498-49DA-84BA-5F96A55A8AC7' \
+  -xctestrun /tmp/openclaw-qa-harness-derived/Build/Products/*.xctestrun \
+  -destination 'platform=iOS Simulator,name=iPhone 16 Pro' \
      -only-testing:OCQAHarnessUITests/ExplorerTests/testAutonomousExploration \
-     -derivedDataPath /tmp/ocqa-harness-dd 2>&1 > /tmp/ocqa-test-output.txt"
+  -resultBundlePath /tmp/ocqa-run.xcresult 2>&1 > /tmp/ocqa-test-output.txt"
 
 # Check results
-ssh taylorolsen-vogt@100.125.133.123 "grep OCQA_ /tmp/ocqa-test-output.txt"
+ssh aarwitz@100.70.115.12 "grep OCQA_ /tmp/ocqa-test-output.txt"
 ```
 
 ### When Running Locally on the Mac (Target State)
 
-When the agent runs on the Mac directly, the SSH layer disappears. ExplorationService.swift already handles direct local execution via Process/Pipe. The orchestrator just needs to be invoked from the desktop app UI.
+When the agent runs on the Mac directly, the SSH layer disappears. ExplorationService already handles local execution via `Process`/`Pipe`, and the fastest manual/media workflow is:
+
+```bash
+./scripts/deploy-and-build.sh --harness
+./scripts/quick-capture.sh explore com.elitepro.resilife --actions 25
+./scripts/quick-capture.sh screenshot
+./scripts/quick-capture.sh tree com.elitepro.resilife
+```
 
 ---
 
@@ -1765,11 +1805,10 @@ When the agent runs on the Mac directly, the SSH layer disappears. ExplorationSe
 
 > Priority order. Items marked BLOCKED require human action first.
 
-### 1. Wire Run-Level Video Recording
-- Before `testAutonomousExploration`, start `xcrun simctl io <UDID> recordVideo /path/to/video.mov`
-- After exploration, stop recording (kill the simctl process)
-- Convert .mov to .mp4 or .webm
-- Store as run artifact, wire to RunDetailView video player
+### 1. Add Timeline-Aware Video UX
+- Keep the current run-level video artifact pipeline, but add finding markers and jump-to-timestamp support in `RunDetailView`
+- Correlate `ActionEvent.stepNumber` / finding timestamps to playback offsets
+- Add screenshot-to-video navigation for debugging
 - **Not blocked — can be implemented now**
 
 ### 2. Visual Regression Baseline System
@@ -1787,7 +1826,7 @@ When the agent runs on the Mac directly, the SSH layer disappears. ExplorationSe
 
 ### 4. Make OrchestratorService Configurable
 - Replace hardcoded `simulatorName = "iPhone 16 Pro"` with project config value
-- Replace hardcoded `maxActions: 200`, `timeoutSeconds: 1800` with project-level settings
+- Replace `RunConfiguration.from(project:)` defaults (`maxActions: 25`, `timeoutSeconds: 300`, `resolvedRuntime: iOS 26.4`) with project-level settings
 - Add simulator selection to ProjectSetupWizard
 - **Not blocked**
 

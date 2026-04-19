@@ -11,6 +11,9 @@
 - [x] Autonomous Exploration Engine — Harness/OCQAHarnessUITests/ExplorerTests.swift implements fully generalized autonomous iOS exploration. Features: depth-first prioritization (content before tab bars), persistent-nav detection (auto-deprioritizes elements appearing across screens), dynamic screen bounds (no hardcoded device dimensions), system alert handling (`addUIInterruptionMonitor`), keyboard dismissal, animation settle detection, crash recovery, loop detection, scroll-then-back stuck recovery. OCQA_ protocol output parsed real-time by ExplorationService.swift.
 - [x] Coverage Flow Map Accuracy — CoverageView now uses real screen names and transition data from the exploration engine via OCQA_TRANSITION events.
 - [x] Accessibility Tree Extraction — `testDumpUITree` exports full element tree via OCQA_UITREE protocol. Exploration loop reads up to 500 elements per screen with type, identifier, label, frame, enabled/hittable state.
+- [x] Screen Recording Pipeline — OrchestratorService now records run-level video via `simctl io recordVideo`, stores it as a `video` artifact, and RunDetailView loads it into an `AVPlayer`.
+- [x] Screenshot Extraction Pipeline — ExplorationService exports `.xcresult` attachments and maps screenshots back to exploration steps.
+- [x] Mac-local Rapid Capture Workflow — `scripts/quick-capture.sh` provides local `screenshot`, `record`, `explore`, and `tree` commands without using the gateway SSH workflow.
 
 ## TODO — Not Yet Implemented
 
@@ -23,8 +26,8 @@
 - For full video recording, two approaches are available:
   1. **`xcrun simctl io <UDID> recordVideo`**: Start before exploration, stop after. Simple but produces one long video.
   2. **`ios-agent record-test`** (used by `~/.openclaw/scripts/ewag-capture.sh`): Records via XCUITest, extracts from xcresult, converts MP4→WebM with ffmpeg, uploads to Google Drive. More mature pipeline.
-- **Status**: Not yet wired into ExplorationService. The xcresult path is already returned; screenshots can be extracted with `xcresulttool`.
-- RunDetailView's video player area is still a placeholder.
+- **Status**: Local run-level recording is already wired into OrchestratorService via `simctl io recordVideo`, and RunDetailView loads local `video` artifacts.
+- **Remaining work**: finding timeline markers, jumps-to-timestamp, optional WebM/export/upload flow, and deciding whether `ios-agent`/Drive upload should be integrated into OpenClawQA proper or remain gateway-only.
 
 ### Integration OAuth Flows
 - Integration cards (GitHub, Jira, Slack, etc.) show from DB but "Configure" buttons are no-ops. No OAuth or webhook setup.
@@ -39,7 +42,7 @@
 
 1. **ResiLife branch state**: Always target `main`. ✅ Resolved.
 2. **Test credentials**: Does ResiLife require login credentials for testing? If so, they need to be stored via KeychainService and passed to the test runner. The explorer currently types generic test data (test@example.com, TestPass123!) when it encounters text fields.
-3. **ResiLife test targets**: `ResiLifeTests` and `ResiLifeUITests` exist but may have limited test coverage. The current pipeline runs `xcodebuild test` against them — are they expected to pass?
+3. **ResiLife test targets**: `ResiLifeTests` and `ResiLifeUITests` exist but may have limited test coverage. OpenClawQA currently skips project-native `xcodebuild test` in favor of exploration-first mode; decide later whether deterministic checks should reincorporate project-native tests.
 4. **Derived data isolation**: The orchestrator uses a temp derived data path (`/tmp/openclaw-qa-derived/<runId>`). This is fine for isolation.
 5. **CI/CD integration**: Is this app intended to run locally only, or should it support remote runners / GitHub Actions triggers?
 
@@ -50,16 +53,16 @@
 - The explorer types generic placeholder text into login fields. **If ResiLife requires real auth**, create test account credentials and add them to the project config (`QAProject.testCredentials` or similar).
 - Consider: does the app have a "demo mode" or test environment bypass?
 
-### 2. Keychain / macOS Permissions on Taylor's Mac
+### 2. Keychain / macOS Permissions on Aaron's Mac
 - OpenClawQA needs Keychain access to store credentials. First run on Mac will prompt for permission — approve it.
 - XCUITest automation requires "Accessibility" permission for the test runner process. Verify in System Settings → Privacy & Security → Accessibility.
 
 ### 3. Code Signing for Harness
-- The OCQAHarness xcodeproj uses automatic signing with `DEVELOPMENT_TEAM = ""`. If Xcode prompts for a team, select Taylor's Apple Developer account.
+- The OCQAHarness xcodeproj uses automatic signing with `DEVELOPMENT_TEAM = ""`. If Xcode prompts for a team, select Aaron's Apple Developer account.
 - For physical device testing (not just simulator), a provisioning profile is needed.
 
 ### 4. GitHub Credentials on Mac
-- Git push from Mac fails (`fatal: could not read Username`). The Mac's `osxkeychain` credential helper has no stored token.
+- Git push from Mac fails due to missing GitHub credentials or repo permission. The current safe workflow is still: Mac commits locally, Linux fetches and pushes.
 - **Fix**: Either add a GitHub PAT to the Mac's keychain, or continue the current workflow (push from Linux only, Mac pulls).
 
 ### 5. Integration OAuth Setup
@@ -71,9 +74,9 @@
 
 ### 6. Video Capture Pipeline Decision
 - Choose between:
-  - (A) `simctl io recordVideo` — simple, one command, produces .mov
-  - (B) `ios-agent record-test` via ewag-capture.sh — more mature, handles conversion/upload
-- Once decided, the wiring into ExplorationService is straightforward.
+  - (A) OpenClawQA local workflow: `simctl`, `.xcresult`, `quick-capture.sh`, local artifacts
+  - (B) Gateway workflow: `ewag-capture.sh`, `ios-agent`, Google Drive upload
+- The open question is no longer how to record video; it is whether Drive upload/export belongs inside OpenClawQA itself or should remain outside the app as a gateway responsibility.
 
 ### 7. Google Drive Upload for Artifacts
 - ewag-capture.sh already handles Google Drive upload. To reuse for OpenClawQA artifacts:
