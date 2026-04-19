@@ -338,7 +338,12 @@ final class OrchestratorService {
 
             // Stop video recording
             if let vp = videoProcess {
-                runner.stopVideoRecording(vp)
+                let stoppedGracefully = runner.stopVideoRecording(vp)
+                if stoppedGracefully {
+                    recordPhase(.exploring, substep: "Video recording stopped", status: "completed")
+                } else {
+                    recordPhase(.exploring, substep: "Video recording force-terminated", status: "failed")
+                }
                 // Allow file to finalize
                 try? await Task.sleep(nanoseconds: 1_000_000_000)
                 if FileManager.default.fileExists(atPath: videoPath) {

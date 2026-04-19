@@ -144,11 +144,26 @@ final class RunnerService {
     }
 
     /// Stop a running video recording process gracefully via SIGINT.
-    func stopVideoRecording(_ process: Process) {
-        if process.isRunning {
-            process.interrupt() // SIGINT triggers graceful stop
-            process.waitUntilExit()
+    /// Returns true when the process exits, false if it had to be force-terminated.
+    func stopVideoRecording(_ process: Process, timeoutSeconds: TimeInterval = 5.0) -> Bool {
+        guard process.isRunning else { return true }
+
+        process.interrupt() // SIGINT triggers graceful stop for simctl recordVideo
+
+        let gracefulDeadline = Date().addingTimeInterval(timeoutSeconds)
+        while process.isRunning && Date() < gracefulDeadline {
+            Thread.sleep(forTimeInterval: 0.05)
         }
+
+        if process.isRunning {
+            process.terminate()
+            let forceDeadline = Date().addingTimeInterval(2.0)
+            while process.isRunning && Date() < forceDeadline {
+                Thread.sleep(forTimeInterval: 0.05)
+            }
+        }
+
+        return !process.isRunning
     }
 
     // MARK: - Helpers (public for orchestrator access)
