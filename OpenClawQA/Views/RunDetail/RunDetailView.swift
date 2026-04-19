@@ -126,7 +126,7 @@ struct RunDetailView: View {
         VStack(spacing: AppSpacing.sm) {
             infoRow("Flow", finding.flow ?? "--")
             infoRow("Screen", finding.screen ?? "--")
-            infoRow("Environment", finding.environment ?? "iPhone 16 Pro (iOS 17.5)")
+            infoRow("Environment", finding.environment ?? "--")
             infoRow("Occurred", finding.lastSeenAt.formatted(date: .abbreviated, time: .shortened)
                      + " (" + finding.lastSeenAt.formatted(.relative(presentation: .named)) + ")")
             infoRow("State", finding.status.rawValue.capitalized)
@@ -189,7 +189,7 @@ struct RunDetailView: View {
                 }
                 .frame(height: 4)
 
-                Text("00:12 / 02:34")
+                Text("--:-- / --:--")
                     .font(AppFont.mono(11))
                     .foregroundColor(AppColors.textSecondary)
 
@@ -292,30 +292,27 @@ struct RunDetailView: View {
     // MARK: - Timeline Content
     private var timelineContent: some View {
         VStack(alignment: .leading, spacing: AppSpacing.md) {
-            let phases: [(String, String, String)] = [
-                ("checkmark.circle.fill", "Preparing", "00:00 - 00:03"),
-                ("checkmark.circle.fill", "Building", "00:03 - 05:42"),
-                ("checkmark.circle.fill", "Installing", "05:42 - 05:58"),
-                ("checkmark.circle.fill", "Deterministic Checks", "05:58 - 08:15"),
-                ("checkmark.circle.fill", "Exploring", "08:15 - 28:30"),
-                ("checkmark.circle.fill", "Analyzing", "28:30 - 31:45"),
-                ("checkmark.circle.fill", "Completed", "31:45 - 32:14"),
-            ]
-
-            ForEach(phases, id: \.0) { phase in
-                HStack(spacing: AppSpacing.md) {
-                    Image(systemName: phase.0)
-                        .foregroundColor(AppColors.success)
-                        .font(.system(size: 14))
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(phase.1)
-                            .font(AppFont.subheading())
-                            .foregroundColor(AppColors.textPrimary)
-                        Text(phase.2)
-                            .font(AppFont.caption())
-                            .foregroundColor(AppColors.textSecondary)
+            let events = appState.runPhaseEvents
+            if events.isEmpty {
+                Text("No timeline data available")
+                    .font(AppFont.caption())
+                    .foregroundColor(AppColors.textTertiary)
+            } else {
+                ForEach(events, id: \.id) { event in
+                    HStack(spacing: AppSpacing.md) {
+                        Image(systemName: event.status == "completed" ? "checkmark.circle.fill" : (event.status == "failed" ? "xmark.circle.fill" : "circle"))
+                            .foregroundColor(event.status == "completed" ? AppColors.success : (event.status == "failed" ? AppColors.error : AppColors.textTertiary))
+                            .font(.system(size: 14))
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(event.phase)
+                                .font(AppFont.subheading())
+                                .foregroundColor(AppColors.textPrimary)
+                            Text(event.timestamp.formatted(date: .omitted, time: .standard))
+                                .font(AppFont.caption())
+                                .foregroundColor(AppColors.textSecondary)
+                        }
+                        Spacer()
                     }
-                    Spacer()
                 }
             }
         }
@@ -325,12 +322,12 @@ struct RunDetailView: View {
     // MARK: - Environment Content
     private var environmentContent: some View {
         VStack(alignment: .leading, spacing: AppSpacing.md) {
-            envRow("Xcode Version", run?.xcodeVersion ?? "16.2")
-            envRow("Simulator", run?.simulatorProfile ?? "iPhone 16 Pro (iOS 17.5)")
-            envRow("Runtime", run?.resolvedRuntime ?? "iOS 17.5")
-            envRow("Branch", run?.branch ?? "main")
+            envRow("Xcode Version", run?.xcodeVersion ?? "--")
+            envRow("Simulator", run?.simulatorProfile ?? "--")
+            envRow("Runtime", run?.resolvedRuntime ?? "--")
+            envRow("Branch", run?.branch ?? "--")
             envRow("Commit", run?.commitSha ?? "--")
-            envRow("Runner", run?.runnerId ?? "Local Runner")
+            envRow("Runner", run?.runnerId ?? "--")
             envRow("Configuration", "Debug")
         }
         .cardStyle()
@@ -352,26 +349,27 @@ struct RunDetailView: View {
     // MARK: - Logs Content
     private var logsContent: some View {
         VStack(alignment: .leading, spacing: 0) {
-            let sampleLogs = [
-                "[09:15:22] Starting autonomous exploration...",
-                "[09:15:23] Screen fingerprint: home_screen_v1",
-                "[09:15:24] Found 12 interactive elements",
-                "[09:15:25] Action: tap 'Login' button",
-                "[09:15:26] Navigated to: login_screen",
-                "[09:15:27] Screen fingerprint: login_screen_v1",
-                "[09:15:28] Action: type email into emailField",
-                "[09:15:30] Action: type password into passwordField",
-                "[09:15:31] Action: tap 'Submit' button",
-                "[09:15:35] WARNING: Login button appears enabled but did not trigger navigation",
-                "[09:15:36] Finding detected: unresponsive_element (confidence: 0.87)",
-                "[09:15:37] Screenshot captured: step_14_login_unresponsive.png",
-            ]
-
-            ForEach(sampleLogs, id: \.self) { line in
-                Text(line)
-                    .font(AppFont.mono(11))
-                    .foregroundColor(line.contains("WARNING") ? AppColors.warning : AppColors.textSecondary)
-                    .padding(.vertical, 1)
+            let logArtifacts = appState.artifacts.filter { $0.type == "build_log" || $0.type == "test_log" || $0.type == "device_log" }
+            if logArtifacts.isEmpty {
+                Text("No log data available")
+                    .font(AppFont.caption())
+                    .foregroundColor(AppColors.textTertiary)
+                    .padding(AppSpacing.md)
+            } else {
+                ForEach(logArtifacts, id: \.id) { artifact in
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(artifact.type)
+                            .font(AppFont.subheading(12))
+                            .foregroundColor(AppColors.accentBlue)
+                        let logContent = (try? String(contentsOfFile: artifact.path, encoding: .utf8))?.suffix(2000) ?? "Unable to read log"
+                        Text(String(logContent))
+                            .font(AppFont.mono(11))
+                            .foregroundColor(AppColors.textSecondary)
+                            .padding(.vertical, 1)
+                            .lineLimit(50)
+                    }
+                    .padding(.bottom, AppSpacing.sm)
+                }
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -383,37 +381,53 @@ struct RunDetailView: View {
     // MARK: - Artifacts Content
     private var artifactsContent: some View {
         VStack(alignment: .leading, spacing: AppSpacing.md) {
-            let artifacts: [(String, String, String)] = [
-                ("photo", "Screenshots (47)", "12.3 MB"),
-                ("video", "Screen Recording", "45.8 MB"),
-                ("doc.text", "Build Log", "234 KB"),
-                ("doc.text", "Explorer Log", "89 KB"),
-                ("folder", "xcresult Bundle", "156.2 MB"),
-                ("exclamationmark.triangle", "Crash Log", "12 KB"),
-            ]
-
-            ForEach(artifacts, id: \.0) { artifact in
-                HStack(spacing: AppSpacing.md) {
-                    Image(systemName: artifact.0)
-                        .foregroundColor(AppColors.accentBlue)
-                        .frame(width: 20)
-                    Text(artifact.1)
-                        .font(AppFont.body())
-                        .foregroundColor(AppColors.textPrimary)
-                    Spacer()
-                    Text(artifact.2)
-                        .font(AppFont.caption())
-                        .foregroundColor(AppColors.textSecondary)
-                    Button(action: {}) {
-                        Image(systemName: "arrow.down.circle")
+            let realArtifacts = appState.artifacts
+            if realArtifacts.isEmpty {
+                Text("No artifacts available")
+                    .font(AppFont.caption())
+                    .foregroundColor(AppColors.textTertiary)
+            } else {
+                ForEach(realArtifacts, id: \.id) { artifact in
+                    HStack(spacing: AppSpacing.md) {
+                        Image(systemName: artifactIcon(artifact.type))
                             .foregroundColor(AppColors.accentBlue)
+                            .frame(width: 20)
+                        Text(artifact.type)
+                            .font(AppFont.body())
+                            .foregroundColor(AppColors.textPrimary)
+                        Spacer()
+                        let size = fileSize(artifact.path)
+                        Text(size)
+                            .font(AppFont.caption())
+                            .foregroundColor(AppColors.textSecondary)
+                        Button(action: { NSWorkspace.shared.selectFile(artifact.path, inFileViewerRootedAtPath: "") }) {
+                            Image(systemName: "arrow.down.circle")
+                                .foregroundColor(AppColors.accentBlue)
+                        }
+                        .buttonStyle(.plain)
                     }
-                    .buttonStyle(.plain)
+                    .padding(.vertical, AppSpacing.xs)
                 }
-                .padding(.vertical, AppSpacing.xs)
             }
         }
         .cardStyle()
+    }
+
+    private func artifactIcon(_ type: String) -> String {
+        switch type {
+        case "screenshot": return "photo"
+        case "build_log", "test_log", "device_log": return "doc.text"
+        case "xcresult": return "folder"
+        default: return "doc"
+        }
+    }
+
+    private func fileSize(_ path: String) -> String {
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: path),
+              let bytes = attrs[.size] as? Int64 else { return "--" }
+        if bytes < 1024 { return "\(bytes) B" }
+        if bytes < 1048576 { return "\(bytes / 1024) KB" }
+        return String(format: "%.1f MB", Double(bytes) / 1048576.0)
     }
 
     // MARK: - Finding Metadata Panel (right side)
@@ -425,7 +439,7 @@ struct RunDetailView: View {
                     Text("Impact")
                         .font(AppFont.heading(14))
                         .foregroundColor(AppColors.textPrimary)
-                    Text(finding.impact ?? "Users cannot log in and are blocked from accessing the app.")
+                    Text(finding.impact ?? "No impact assessment available.")
                         .font(AppFont.caption())
                         .foregroundColor(AppColors.textSecondary)
                         .lineSpacing(3)
@@ -434,7 +448,7 @@ struct RunDetailView: View {
                 Divider().background(AppColors.border)
 
                 // Affected Builds
-                metaRow("Affected Builds", finding.affectedBuilds ?? "1.4.2 (45)")
+                metaRow("Affected Builds", finding.affectedBuilds ?? "--")
                 metaRow("First Seen", finding.firstSeenAt.formatted(date: .abbreviated, time: .shortened))
                 metaRow("Last Seen", finding.lastSeenAt.formatted(date: .abbreviated, time: .shortened))
                 metaRow("Occurrences", "\(finding.occurrences)")

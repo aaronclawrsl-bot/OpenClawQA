@@ -7,6 +7,11 @@ final class RunnerService {
 
     private init() {}
 
+    enum ProjectTarget {
+        case project(String)   // -project path.xcodeproj
+        case workspace(String) // -workspace path.xcworkspace
+    }
+
     struct RunnerHealth {
         var isOnline: Bool
         var xcodeVersion: String?
@@ -17,8 +22,8 @@ final class RunnerService {
 
     // Check local runner health
     func checkLocalHealth() async -> RunnerHealth {
-        let xcodeVersion = await runCommand("xcodebuild", arguments: ["-version"])
-        let simList = await runCommand("xcrun", arguments: ["simctl", "list", "devices", "available", "-j"])
+        let xcodeVersion = await runShellCommand("xcodebuild", arguments: ["-version"])
+        let simList = await runShellCommand("xcrun", arguments: ["simctl", "list", "devices", "available", "-j"])
 
         return RunnerHealth(
             isOnline: true,
@@ -31,38 +36,73 @@ final class RunnerService {
 
     // Boot simulator
     func bootSimulator(udid: String) async -> Bool {
-        let result = await runCommand("xcrun", arguments: ["simctl", "boot", udid])
+        let result = await runShellCommand("xcrun", arguments: ["simctl", "boot", udid])
         return result != nil
     }
 
-    // Build project
-    func buildProject(workspace: String, scheme: String, simulator: String, derivedDataPath: String) async -> (success: Bool, log: String) {
-        let args = [
-            "build-for-testing",
-            "-workspace", workspace,
+    // Find simulator UDID by name
+    func findSimulatorUDID(name: String) async -> String? {
+        let json = await runShellCommand("xcrun", arguments: ["simctl", "list", "devices", "available", "-j"])
+        guard let data = json?.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let devices = obj["devices"] as? [String: [[String: Any]]] else { return nil }
+
+        for (_, deviceList) in devices {
+            for device in deviceList {
+                if let deviceName = device["name"] as? String,
+                   deviceName == name,
+                   let udid = device["udid"] as? String,
+                   device["isAvailable"] as? Bool == true {
+                    return udid
+                }
+            }
+        }
+        return nil
+    }
+
+    // Build project (supports both -project and -workspace)
+    func buildProject(projectOrWorkspace: ProjectTarget, scheme: String, simulator: String, derivedDataPath: String) async -> (success: Bool, log: String) {
+        var args = ["build-for-testing"]
+
+        switch projectOrWorkspace {
+        case .project(let path):
+            args += ["-project", path]
+        case .workspace(let path):
+            args += ["-workspace", path]
+        }
+
+        args += [
+            "-scheme", scheme,
+            "-destination", "platform=iOS Simulator,name=\(simulator)",
+            "-derivedDataPath", derivedDataPath
+        ]
+
+        let result = await runShellCommand("xcodebuild", arguments: args)
+        let success = result?.contains("BUILD SUCCEEDED") == true || result?.contains("** BUILD SUCCEEDED **") == true
+        return (success, result ?? "Build produced no output")
+    }
+
+    // Run tests (supports both -project and -workspace)
+    func runTests(projectOrWorkspace: ProjectTarget, scheme: String, simulator: String, derivedDataPath: String) async -> (success: Bool, log: String) {
+        var args = ["test"]
+
+        switch projectOrWorkspace {
+        case .project(let path):
+            args += ["-project", path]
+        case .workspace(let path):
+            args += ["-workspace", path]
+        }
+
+        args += [
             "-scheme", scheme,
             "-destination", "platform=iOS Simulator,name=\(simulator)",
             "-derivedDataPath", derivedDataPath,
-            "-quiet"
-        ]
-        let result = await runCommand("xcodebuild", arguments: args)
-        return (result != nil, result ?? "Build failed")
-    }
-
-    // Run tests
-    func runTests(workspace: String, scheme: String, simulator: String, testClass: String?) async -> (success: Bool, log: String) {
-        var args = [
-            "test",
-            "-workspace", workspace,
-            "-scheme", scheme,
-            "-destination", "platform=iOS Simulator,name=\(simulator)",
             "-parallel-testing-enabled", "NO"
         ]
-        if let testClass = testClass {
-            args += ["-only-testing", testClass]
-        }
-        let result = await runCommand("xcodebuild", arguments: args)
-        return (result != nil, result ?? "Test execution failed")
+
+        let result = await runShellCommand("xcodebuild", arguments: args)
+        let success = result?.contains("** TEST SUCCEEDED **") == true
+        return (success, result ?? "Test execution produced no output")
     }
 
     // MARK: - Remote Runner
@@ -75,30 +115,47 @@ final class RunnerService {
             "\(user)@\(host)",
             command
         ]
-        return await runCommand("ssh", arguments: args)
+        return await runShellCommand("ssh", arguments: args)
     }
 
-    // MARK: - Helpers
-    private func runCommand(_ command: String, arguments: [String]) async -> String? {
+    // MARK: - Helpers (public for orchestrator access)
+    func runShellCommand(_ command: String, arguments: [String]) async -> String? {
         let process = Process()
-        let pipe = Pipe()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/\(command)")
-        process.arguments = arguments
-        process.standardOutput = pipe
-        process.standardError = pipe
+        let outPipe = Pipe()
+        let errPipe = Pipe()
+
+        // Try common paths
+        let paths = ["/usr/bin/\(command)", "/usr/local/bin/\(command)", "/opt/homebrew/bin/\(command)"]
+        var execPath: String?
+        for p in paths {
+            if FileManager.default.fileExists(atPath: p) { execPath = p; break }
+        }
+        // Fall back to env lookup
+        if execPath == nil {
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+            process.arguments = [command] + arguments
+        } else {
+            process.executableURL = URL(fileURLWithPath: execPath!)
+            process.arguments = arguments
+        }
+
+        process.standardOutput = outPipe
+        process.standardError = errPipe
 
         do {
             try process.run()
             process.waitUntilExit()
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            return String(data: data, encoding: .utf8)
+            let outData = outPipe.fileHandleForReading.readDataToEndOfFile()
+            let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+            let output = String(data: outData, encoding: .utf8) ?? ""
+            let errOutput = String(data: errData, encoding: .utf8) ?? ""
+            return output + (errOutput.isEmpty ? "" : "\n" + errOutput)
         } catch {
             return nil
         }
     }
 
     private func parseSimulators(_ json: String) -> [String] {
-        // Simple parser - extract device names from simctl JSON
         guard let data = json.data(using: .utf8),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let devices = obj["devices"] as? [String: [[String: Any]]] else { return [] }
@@ -121,6 +178,6 @@ final class RunnerService {
         let fileManager = FileManager.default
         guard let attrs = try? fileManager.attributesOfFileSystem(forPath: "/"),
               let freeSpace = attrs[.systemFreeSize] as? Int64 else { return nil }
-        return Double(freeSpace) / 1_073_741_824 // Convert to GB
+        return Double(freeSpace) / 1_073_741_824
     }
 }

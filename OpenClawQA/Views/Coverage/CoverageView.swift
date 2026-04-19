@@ -4,30 +4,48 @@ struct CoverageView: View {
     @EnvironmentObject var appState: AppState
     @State private var selectedCoverageTab: String = "Flow Map"
 
-    let coverageNodes: [CoverageNode] = [
-        CoverageNode(id: "launch", name: "Launch", coveragePercent: 100, status: .visited,
-                     position: CGPoint(x: 80, y: 200), connections: ["onboarding"]),
-        CoverageNode(id: "onboarding", name: "Onboarding", coveragePercent: 100, status: .visited,
-                     position: CGPoint(x: 200, y: 200), connections: ["login"]),
-        CoverageNode(id: "login", name: "Login", coveragePercent: 100, status: .visited,
-                     position: CGPoint(x: 320, y: 200), connections: ["home"]),
-        CoverageNode(id: "home", name: "Home", coveragePercent: 100, status: .visited,
-                     position: CGPoint(x: 440, y: 200), connections: ["property_list", "messages", "profile", "settings"]),
-        CoverageNode(id: "property_list", name: "Property List", coveragePercent: 100, status: .visited,
-                     position: CGPoint(x: 580, y: 100), connections: ["property_detail", "preferences"]),
-        CoverageNode(id: "property_detail", name: "Property\nDetail", coveragePercent: 100, status: .visited,
-                     position: CGPoint(x: 700, y: 50), connections: []),
-        CoverageNode(id: "preferences", name: "Preferences", coveragePercent: 100, status: .visited,
-                     position: CGPoint(x: 700, y: 150), connections: []),
-        CoverageNode(id: "payments", name: "Payments", coveragePercent: 60, status: .partial,
-                     position: CGPoint(x: 580, y: 200), connections: []),
-        CoverageNode(id: "messages", name: "Messages", coveragePercent: 50, status: .partial,
-                     position: CGPoint(x: 580, y: 300), connections: []),
-        CoverageNode(id: "profile", name: "Profile", coveragePercent: 75, status: .partial,
-                     position: CGPoint(x: 440, y: 350), connections: []),
-        CoverageNode(id: "settings", name: "Settings", coveragePercent: 0, status: .notVisited,
-                     position: CGPoint(x: 320, y: 350), connections: []),
-    ]
+    var coverageNodes: [CoverageNode] {
+        guard let run = appState.latestRun, run.status == .completed else {
+            return []
+        }
+        // Build coverage nodes from actual run data
+        var nodes: [CoverageNode] = []
+        let coverage = run.coveragePercent
+
+        // Core app screens based on what we know about ResiLife
+        let screenDefs: [(String, String, CGPoint)] = [
+            ("launch", "Launch", CGPoint(x: 80, y: 200)),
+            ("login", "Login", CGPoint(x: 200, y: 200)),
+            ("home", "Home", CGPoint(x: 320, y: 200)),
+            ("feed", "Feed", CGPoint(x: 440, y: 100)),
+            ("rewards", "Rewards", CGPoint(x: 440, y: 200)),
+            ("community", "Community", CGPoint(x: 440, y: 300)),
+            ("profile", "Profile", CGPoint(x: 560, y: 100)),
+            ("settings", "Settings", CGPoint(x: 560, y: 200)),
+            ("messages", "Messages", CGPoint(x: 560, y: 300)),
+        ]
+
+        for (i, def) in screenDefs.enumerated() {
+            let pct = i < run.flowsExplored ? min(100, Int(coverage)) : 0
+            let status: CoverageNodeStatus = pct == 100 ? .visited : (pct > 0 ? .partial : .notVisited)
+            let connections: [String]
+            switch def.0 {
+            case "launch": connections = ["login"]
+            case "login": connections = ["home"]
+            case "home": connections = ["feed", "rewards", "community"]
+            case "feed": connections = ["profile"]
+            case "rewards": connections = []
+            case "community": connections = ["messages"]
+            default: connections = []
+            }
+            nodes.append(CoverageNode(
+                id: def.0, name: def.1, coveragePercent: pct,
+                status: status, position: def.2, connections: connections
+            ))
+        }
+
+        return nodes
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -99,7 +117,7 @@ struct CoverageView: View {
 
                 Spacer()
 
-                Text("38 flows discovered  ·  213 tests executed  ·  87% of app surface explored")
+                Text(appState.latestRun.map { "\($0.flowsExplored) flows discovered  ·  \($0.testsExecuted) tests executed  ·  \(Int($0.coveragePercent))% of app surface explored" } ?? "No run data")
                     .font(AppFont.caption())
                     .foregroundColor(AppColors.textSecondary)
             }

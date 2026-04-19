@@ -30,50 +30,15 @@ struct IntegrationsView: View {
                     GridItem(.flexible()),
                     GridItem(.flexible()),
                 ], spacing: AppSpacing.lg) {
-                    // GitHub
-                    integrationCard(
-                        icon: "chevron.left.forwardslash.chevron.right",
-                        iconColor: Color.white,
-                        name: "GitHub",
-                        detail: "Connected as resilife-bot",
-                        isConnected: true
-                    )
-
-                    // Jira
-                    integrationCard(
-                        icon: "ticket",
-                        iconColor: AppColors.accentBlue,
-                        name: "Jira",
-                        detail: "Project: RESI",
-                        isConnected: true
-                    )
-
-                    // Slack
-                    integrationCard(
-                        icon: "number",
-                        iconColor: AppColors.success,
-                        name: "Slack",
-                        detail: "Channel: #qa-alerts",
-                        isConnected: true
-                    )
-
-                    // Email
-                    integrationCard(
-                        icon: "envelope.fill",
-                        iconColor: AppColors.error,
-                        name: "Email",
-                        detail: "Recipients: 3",
-                        isConnected: true
-                    )
-
-                    // Jenkins
-                    integrationCard(
-                        icon: "wrench.and.screwdriver",
-                        iconColor: AppColors.high,
-                        name: "Jenkins",
-                        detail: "Connected",
-                        isConnected: true
-                    )
+                    ForEach(appState.integrations) { integration in
+                        integrationCard(
+                            icon: iconFor(integration.type.rawValue),
+                            iconColor: colorFor(integration.type.rawValue),
+                            name: integration.displayName,
+                            detail: integration.isConnected ? "Connected" : "Disconnected",
+                            isConnected: integration.isConnected
+                        )
+                    }
 
                     // Add Integration
                     addIntegrationCard
@@ -154,5 +119,25 @@ struct IntegrationsView: View {
             RoundedRectangle(cornerRadius: 8)
                 .strokeBorder(AppColors.border, style: StrokeStyle(lineWidth: 1, dash: [6]))
         )
+    }
+
+    private func iconFor(_ type: String) -> String {
+        switch type.lowercased() {
+        case "github": return "chevron.left.forwardslash.chevron.right"
+        case "jira": return "ticket"
+        case "slack": return "number"
+        case "email": return "envelope.fill"
+        default: return "link"
+        }
+    }
+
+    private func colorFor(_ type: String) -> Color {
+        switch type.lowercased() {
+        case "github": return .white
+        case "jira": return AppColors.accentBlue
+        case "slack": return AppColors.success
+        case "email": return AppColors.error
+        default: return AppColors.textSecondary
+        }
     }
 }

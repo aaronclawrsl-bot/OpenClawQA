@@ -3,8 +3,8 @@ import SwiftUI
 struct SettingsView: View {
     @EnvironmentObject var appState: AppState
     @State private var selectedSection: String = "General"
-    @State private var projectName: String = "ResiLife iOS"
-    @State private var defaultEnvironment: String = "iPhone 15 Pro (iOS 17.5)"
+    @State private var projectName: String = ""
+    @State private var defaultEnvironment: String = ""
     @State private var defaultRunType: String = "Full Exploration"
     @State private var autoStartOnCommit: Bool = true
     @State private var compareAgainstPrevious: Bool = true
@@ -72,6 +72,12 @@ struct SettingsView: View {
             .frame(maxWidth: .infinity)
         }
         .background(AppColors.windowBackground)
+        .onAppear {
+            if let p = appState.currentProject {
+                projectName = p.name
+                defaultEnvironment = appState.latestRun?.simulatorProfile ?? "iPhone 16 Pro"
+            }
+        }
     }
 
     // MARK: - General Settings
@@ -112,7 +118,7 @@ struct SettingsView: View {
                     .font(AppFont.heading(16))
                     .foregroundColor(AppColors.textPrimary)
 
-                ForEach(["iPhone 16 Pro (iOS 17.5)", "iPhone 16 Pro Max (iOS 17.5)", "iPhone SE (iOS 17.5)", "iPad Pro 12.9\" (iOS 17.5)"], id: \.self) { sim in
+                ForEach(availableSimulators(), id: \.self) { sim in
                     HStack {
                         Image(systemName: "iphone")
                             .foregroundColor(AppColors.textSecondary)
@@ -120,7 +126,7 @@ struct SettingsView: View {
                             .font(AppFont.body())
                             .foregroundColor(AppColors.textPrimary)
                         Spacer()
-                        if sim == "iPhone 16 Pro (iOS 17.5)" {
+                        if sim == defaultEnvironment {
                             Text("Default")
                                 .font(AppFont.caption(10))
                                 .foregroundColor(AppColors.accentBlue)
@@ -296,7 +302,7 @@ struct SettingsView: View {
                         .font(AppFont.body())
                         .foregroundColor(AppColors.textSecondary)
                     Spacer()
-                    Text("2.4 MB")
+                    Text(databaseSize())
                         .font(AppFont.mono(11))
                         .foregroundColor(AppColors.textTertiary)
                 }
@@ -374,5 +380,41 @@ struct SettingsView: View {
                 .toggleStyle(.switch)
                 .tint(AppColors.accentBlue)
         }
+    }
+
+    private func availableSimulators() -> [String] {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/xcrun")
+        process.arguments = ["simctl", "list", "devices", "available", "-j"]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = Pipe()
+        try? process.run()
+        process.waitUntilExit()
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let devices = json["devices"] as? [String: [[String: Any]]] else {
+            return [defaultEnvironment].filter { !$0.isEmpty }
+        }
+        var names: [String] = []
+        for (runtime, deviceList) in devices {
+            for device in deviceList {
+                if let name = device["name"] as? String, let state = device["state"] as? String {
+                    let runtimeShort = runtime.components(separatedBy: ".").last?.replacingOccurrences(of: "-", with: ".") ?? ""
+                    names.append("\(name) (\(runtimeShort)) - \(state)")
+                }
+            }
+        }
+        return Array(names.prefix(8))
+    }
+
+    private func databaseSize() -> String {
+        let path = NSSearchPathForDirectoriesInDomains(.applicationSupportDirectory, .userDomainMask, true).first ?? ""
+        let dbPath = (path as NSString).appendingPathComponent("OpenClawQA/openclaw-qa.db")
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: dbPath),
+              let bytes = attrs[.size] as? Int64 else { return "--" }
+        if bytes < 1024 { return "\(bytes) B" }
+        if bytes < 1048576 { return "\(bytes / 1024) KB" }
+        return String(format: "%.1f MB", Double(bytes) / 1048576.0)
     }
 }

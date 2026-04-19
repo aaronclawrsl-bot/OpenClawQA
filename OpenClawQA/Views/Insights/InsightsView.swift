@@ -37,29 +37,33 @@ struct InsightsView: View {
 
                 // Stats grid
                 HStack(spacing: AppSpacing.lg) {
+                    let confTrend = computeConfidenceTrend()
+                    let totalFindings = appState.findings.count
+                    let avgDuration = computeAvgDuration()
+
                     insightStatCard(
                         title: "Release Confidence Trend",
-                        value: "+18%",
-                        valueColor: AppColors.success,
-                        icon: "arrow.up.right"
+                        value: confTrend >= 0 ? "+\(confTrend)%" : "\(confTrend)%",
+                        valueColor: confTrend >= 0 ? AppColors.success : AppColors.error,
+                        icon: confTrend >= 0 ? "arrow.up.right" : "arrow.down.right"
                     )
                     insightStatCard(
                         title: "Bugs Found",
-                        value: "23",
-                        valueColor: AppColors.error,
+                        value: "\(totalFindings)",
+                        valueColor: totalFindings > 0 ? AppColors.error : AppColors.success,
                         icon: "ladybug"
                     )
                     insightStatCard(
                         title: "Avg. Run Time",
-                        value: "32m",
+                        value: avgDuration,
                         valueColor: AppColors.accentBlue,
                         icon: "clock"
                     )
                     insightStatCard(
-                        title: "Flaky Tests",
-                        value: "3",
+                        title: "Total Runs",
+                        value: "\(appState.runs.count)",
                         valueColor: AppColors.warning,
-                        icon: "arrow.triangle.2.circlepath"
+                        icon: "play.circle"
                     )
                 }
 
@@ -104,10 +108,16 @@ struct InsightsView: View {
                 .foregroundColor(AppColors.textPrimary)
 
             VStack(spacing: AppSpacing.md) {
-                issueCategoryBar("Functional", count: 12, maxCount: 12, color: AppColors.critical)
-                issueCategoryBar("UI / Layout", count: 6, maxCount: 12, color: AppColors.high)
-                issueCategoryBar("Performance", count: 3, maxCount: 12, color: AppColors.warning)
-                issueCategoryBar("Other", count: 2, maxCount: 12, color: AppColors.textTertiary)
+                let cats = computeIssueCategories()
+                let maxC = cats.map(\.1).max() ?? 1
+                ForEach(cats, id: \.0) { cat in
+                    issueCategoryBar(cat.0, count: cat.1, maxCount: max(1, maxC), color: categoryColor(cat.0))
+                }
+                if cats.isEmpty {
+                    Text("No findings yet")
+                        .font(AppFont.caption())
+                        .foregroundColor(AppColors.textTertiary)
+                }
             }
         }
         .cardStyle()
@@ -147,11 +157,15 @@ struct InsightsView: View {
                 .foregroundColor(AppColors.textPrimary)
 
             VStack(spacing: AppSpacing.md) {
-                activityRow("May 24, 9:41 AM", "2 critical issues found in PR #248")
-                activityRow("May 24, 8:09 AM", "QA check completed on main")
-                activityRow("May 23, 11:22 PM", "New run triggered by push")
-                activityRow("May 23, 6:15 PM", "PR #248 QA check started")
-                activityRow("May 23, 11:02 AM", "Scheduled run completed")
+                let activities = computeRecentActivity()
+                ForEach(activities, id: \.0) { activity in
+                    activityRow(activity.0, activity.1)
+                }
+                if activities.isEmpty {
+                    Text("No activity yet")
+                        .font(AppFont.caption())
+                        .foregroundColor(AppColors.textTertiary)
+                }
             }
 
             Button(action: {}) {
@@ -174,6 +188,70 @@ struct InsightsView: View {
                 .font(AppFont.body())
                 .foregroundColor(AppColors.textSecondary)
             Spacer()
+        }
+    }
+
+    // MARK: - Computed Insights
+
+    private func computeConfidenceTrend() -> Int {
+        let runs = appState.runs.prefix(10)
+        guard runs.count >= 2 else { return 0 }
+        let latest = runs.first?.confidenceScore ?? 0
+        let previous = runs.dropFirst().first?.confidenceScore ?? 0
+        return latest - previous
+    }
+
+    private func computeAvgDuration() -> String {
+        let completedRuns = appState.runs.filter { $0.status == .completed && $0.durationMs != nil }
+        guard !completedRuns.isEmpty else { return "--" }
+        let avg = completedRuns.compactMap(\.durationMs).reduce(0, +) / completedRuns.count
+        let minutes = avg / 60000
+        return "\(minutes)m"
+    }
+
+    private func computeIssueCategories() -> [(String, Int)] {
+        var cats: [String: Int] = [:]
+        for f in appState.findings {
+            let cat = categorizeForInsight(f.category)
+            cats[cat, default: 0] += 1
+        }
+        return cats.sorted { $0.value > $1.value }
+    }
+
+    private func categorizeForInsight(_ category: FindingCategory) -> String {
+        switch category {
+        case .buildFailure, .launchFailure, .crash, .deterministicCheckFailure, .authFailure:
+            return "Functional"
+        case .layoutOverlap, .textClipping, .missingAsset, .blankScreen, .visualRegression:
+            return "UI / Layout"
+        case .performanceTimeout, .appHang:
+            return "Performance"
+        default:
+            return "Other"
+        }
+    }
+
+    private func categoryColor(_ name: String) -> Color {
+        switch name {
+        case "Functional": return AppColors.critical
+        case "UI / Layout": return AppColors.high
+        case "Performance": return AppColors.warning
+        default: return AppColors.textTertiary
+        }
+    }
+
+    private func computeRecentActivity() -> [(String, String)] {
+        return appState.runs.prefix(5).map { run in
+            let time = run.startedAt?.formatted(date: .abbreviated, time: .shortened) ?? "--"
+            let desc: String
+            if run.status == .completed {
+                desc = "QA check completed on \(run.branch) — \(run.criticalFindings) critical, \(run.highFindings) high"
+            } else if run.status == .failed {
+                desc = "Run failed on \(run.branch)"
+            } else {
+                desc = "Run \(run.status.rawValue) on \(run.branch)"
+            }
+            return (time, desc)
         }
     }
 }

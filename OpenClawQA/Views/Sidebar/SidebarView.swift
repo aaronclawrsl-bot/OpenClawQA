@@ -144,7 +144,7 @@ struct SidebarView: View {
                 Image(systemName: "app.badge")
                     .font(.system(size: 10))
                     .foregroundColor(AppColors.textSecondary)
-                Text("iOS App 1.4.2 (45)")
+                Text(project.bundleId)
                     .font(AppFont.caption())
                     .foregroundColor(AppColors.textSecondary)
             }
@@ -160,16 +160,16 @@ struct SidebarView: View {
                 .fill(AppColors.accentPurple.opacity(0.3))
                 .frame(width: 32, height: 32)
                 .overlay(
-                    Text("AJ")
+                    Text("QA")
                         .font(AppFont.caption(11))
                         .foregroundColor(AppColors.accentPurple)
                 )
 
             VStack(alignment: .leading, spacing: 2) {
-                Text("Alex Johnson")
+                Text("Local Runner")
                     .font(AppFont.subheading(12))
                     .foregroundColor(AppColors.textPrimary)
-                Text("alex@resilife.app")
+                Text(NSFullUserName())
                     .font(AppFont.caption(10))
                     .foregroundColor(AppColors.textSecondary)
             }

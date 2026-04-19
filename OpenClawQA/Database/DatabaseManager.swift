@@ -9,7 +9,6 @@ final class DatabaseManager {
     private init() {
         openDatabase()
         createTables()
-        seedDemoDataIfEmpty()
     }
 
     deinit {
@@ -518,132 +517,115 @@ final class DatabaseManager {
         )
     }
 
-    // MARK: - Seed Demo Data
-    private func seedDemoDataIfEmpty() {
+    // MARK: - Update Run (full)
+    func updateRun(_ r: QARun) {
+        let sql = """
+            UPDATE runs SET status = ?, phase = ?, runner_id = ?, xcode_version = ?,
+            simulator_profile = ?, resolved_runtime = ?, started_at = ?, ended_at = ?,
+            confidence_score = ?, release_readiness = ?, critical_findings = ?, high_findings = ?,
+            medium_findings = ?, low_findings = ?, tests_executed = ?, flows_explored = ?,
+            coverage_percent = ?, duration_ms = ?, commit_sha = ?, branch = ?
+            WHERE id = ?
+        """
         var stmt: OpaquePointer?
-        sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM projects", -1, &stmt, nil)
-        sqlite3_step(stmt)
-        let count = sqlite3_column_int(stmt, 0)
+        if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK {
+            bindText(stmt, 1, r.status.rawValue)
+            bindText(stmt, 2, r.phase.rawValue)
+            bindText(stmt, 3, r.runnerId)
+            bindText(stmt, 4, r.xcodeVersion)
+            bindText(stmt, 5, r.simulatorProfile)
+            bindText(stmt, 6, r.resolvedRuntime)
+            bindText(stmt, 7, r.startedAt.map { dateStr($0) })
+            bindText(stmt, 8, r.endedAt.map { dateStr($0) })
+            if let cs = r.confidenceScore { sqlite3_bind_int(stmt, 9, Int32(cs)) } else { sqlite3_bind_null(stmt, 9) }
+            bindText(stmt, 10, r.releaseReadiness?.rawValue)
+            sqlite3_bind_int(stmt, 11, Int32(r.criticalFindings))
+            sqlite3_bind_int(stmt, 12, Int32(r.highFindings))
+            sqlite3_bind_int(stmt, 13, Int32(r.mediumFindings))
+            sqlite3_bind_int(stmt, 14, Int32(r.lowFindings))
+            sqlite3_bind_int(stmt, 15, Int32(r.testsExecuted))
+            sqlite3_bind_int(stmt, 16, Int32(r.flowsExplored))
+            sqlite3_bind_double(stmt, 17, r.coveragePercent)
+            if let d = r.durationMs { sqlite3_bind_int(stmt, 18, Int32(d)) } else { sqlite3_bind_null(stmt, 18) }
+            bindText(stmt, 19, r.commitSha)
+            bindText(stmt, 20, r.branch)
+            bindText(stmt, 21, r.id)
+            sqlite3_step(stmt)
+        }
         sqlite3_finalize(stmt)
-        guard count == 0 else { return }
+    }
 
-        let now = Date()
-        let cal = Calendar.current
-        let projectId = "proj-resilife-001"
-
-        // Project
-        insertProject(QAProject(
-            id: projectId, name: "ResiLife iOS", repoType: "github",
-            repoIdentifier: "EWAG-dev/iosApp", localRepoPath: "/Users/taylorolsen-vogt/iosApp",
-            defaultBranch: "main", workspacePath: "ResiLife.xcworkspace",
-            scheme: "ResiLife", configuration: "Debug",
-            bundleId: "com.elitepro.resilife", runnerMode: "local",
-            createdAt: cal.date(byAdding: .day, value: -30, to: now)!, updatedAt: now
-        ))
-
-        // Demo Runs
-        let runs: [(String, String, String, String, String, RunStatus, Int, ReleaseReadiness, Int, Int, Int, Int, Int, Int, Double, Int)] = [
-            ("run-001", "GitHub Push", "main", "a1b2c3d", "May 24, 9:41 AM", .completed, 91, .ready, 2, 4, 7, 0, 213, 38, 87.0, 1934000),
-            ("run-002", "PR #248", "feature/payments", "d4e5f6a", "May 23, 6:15 PM", .completed, 78, .caution, 1, 5, 3, 2, 189, 32, 79.0, 1711000),
-            ("run-003", "Scheduled", "main", "c7d8e9f", "May 23, 11:02 AM", .failed, 86, .caution, 0, 6, 4, 1, 201, 35, 85.0, 1810000),
-            ("run-004", "GitHub Push", "main", "b1c2d3e", "May 22, 10:30 PM", .completed, 93, .ready, 0, 4, 5, 0, 220, 40, 89.0, 1908000),
-            ("run-005", "PR #247", "feature/profile", "f1a2b3c", "May 22, 9:05 AM", .completed, 73, .caution, 0, 6, 8, 1, 198, 30, 76.0, 1653000),
-        ]
-
-        for r in runs {
-            let baseDate = cal.date(byAdding: .day, value: -2, to: now)!
-            insertRun(QARun(
-                id: r.0, projectId: projectId, triggerSource: r.1, branch: r.2,
-                commitSha: r.3, status: r.5, phase: r.5 == .completed ? .completed : .failed,
-                xcodeVersion: "16.2", simulatorProfile: "iPhone 16 Pro (iOS 17.5)",
-                startedAt: baseDate, endedAt: baseDate.addingTimeInterval(Double(r.15) / 1000),
-                confidenceScore: r.6, releaseReadiness: r.7,
-                criticalFindings: r.8, highFindings: r.9, mediumFindings: r.10, lowFindings: r.11,
-                testsExecuted: r.12, flowsExplored: r.13, coveragePercent: r.14, durationMs: r.15
-            ))
+    // MARK: - Artifacts CRUD
+    func insertArtifact(_ a: QAArtifact) {
+        let sql = "INSERT INTO artifacts (id, run_id, type, path, metadata, created_at) VALUES (?,?,?,?,?,?)"
+        var stmt: OpaquePointer?
+        if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK {
+            bindText(stmt, 1, a.id); bindText(stmt, 2, a.runId)
+            bindText(stmt, 3, a.type); bindText(stmt, 4, a.path)
+            bindText(stmt, 5, a.metadata); bindText(stmt, 6, dateStr(a.createdAt))
+            sqlite3_step(stmt)
         }
+        sqlite3_finalize(stmt)
+    }
 
-        // Demo Findings
-        let findings: [(String, String, FindingCategory, String, FindingSeverity, String, String, String, String)] = [
-            ("find-001", "run-001", .unresponsiveElement, "Login button not responding",
-             .critical, "Onboarding > Login", "Login Screen",
-             "The login button appears enabled but does not trigger any action. This may be caused by a JavaScript bridge issue or disabled state not being updated.",
-             "Check the onPress event for the login button and ensure the action is not blocked by a loading state or validation logic."),
-            ("find-002", "run-001", .crash, "App crashes on tapping property card",
-             .critical, "Home > Property", "Property Detail",
-             "The app crashes with an unrecognized selector exception when tapping the featured property card on the home screen.",
-             "Check the property card's tap gesture handler for nil optionals or type mismatches in the property model."),
-            ("find-003", "run-001", .textClipping, "Bottom sheet text cutoff",
-             .high, "Property > Details", "Property Bottom Sheet",
-             "Long property descriptions are being clipped at the bottom of the detail sheet without scroll support.",
-             "Add a ScrollView wrapper around the description text in the bottom sheet content view."),
-            ("find-004", "run-001", .missingAsset, "Image not loading",
-             .high, "Property > Details", "Property Gallery",
-             "Property gallery images fail to load and show placeholder indefinitely. Network connectivity appears normal.",
-             "Check the image URL construction and CDN configuration for the property media endpoint."),
-            ("find-005", "run-001", .blankScreen, "Empty state misleading",
-             .medium, "Messages > Inbox", "Messages Screen",
-             "The messages screen shows a completely blank state with no empty-state message or call-to-action.",
-             "Add an empty state view with appropriate messaging when no conversations exist."),
-            ("find-006", "run-001", .navigationDeadEnd, "Settings dead end on Privacy",
-             .medium, "Settings > Privacy", "Privacy Settings",
-             "Tapping 'Privacy Policy' in settings navigates to a blank WebView that never loads content.",
-             "Verify the privacy policy URL is correctly configured and the WebView has proper error handling."),
-            ("find-007", "run-001", .layoutOverlap, "Tab bar overlaps content",
-             .medium, "Community > Feed", "Community Feed",
-             "The last item in the community feed is partially hidden behind the tab bar on smaller devices.",
-             "Add appropriate bottom padding or safe area insets to the feed scroll view."),
-            ("find-008", "run-002", .authFailure, "OAuth token refresh fails",
-             .high, "Login > OAuth", "OAuth Screen",
-             "The OAuth token refresh silently fails, leaving the user stuck on a loading screen.",
-             "Implement proper error handling for the token refresh flow with user-visible retry option."),
-            ("find-009", "run-001", .performanceTimeout, "Rewards screen slow load",
-             .medium, "Rewards", "Rewards Screen",
-             "The Rewards tab takes over 5 seconds to load content, exceeding the expected performance threshold.",
-             "Investigate the rewards API response time and consider implementing local caching."),
-            ("find-010", "run-002", .visualRegression, "Button color regression",
-             .medium, "Onboarding > Welcome", "Welcome Screen",
-             "The primary CTA button on the welcome screen has changed from brand blue to a gray color, likely a theme regression.",
-             "Check the button style configuration for the welcome screen against the design system tokens."),
-            ("find-011", "run-001", .unexpectedModal, "Debug alert in production",
-             .high, "Home", "Home Screen",
-             "A debug alert with technical error information appears briefly on the home screen during initial load.",
-             "Remove or guard the debug alert behind a build configuration check."),
-            ("find-012", "run-001", .permissionBlocker, "Camera permission blocks scan",
-             .medium, "Rewards > Scan", "QR Scanner",
-             "The QR scanner feature is completely blocked if camera permission was previously denied, with no guidance for the user.",
-             "Add a permission denied state with instructions to enable camera access in Settings."),
-            ("find-013", "run-001", .appHang, "Main thread hang on profile",
-             .medium, "Profile", "Profile Screen",
-             "The app hangs for 2+ seconds when navigating to the profile screen, likely due to synchronous image loading on the main thread.",
-             "Move profile image loading to a background thread and show a placeholder while loading."),
-        ]
-
-        for f in findings {
-            insertFinding(QAFinding(
-                id: f.0, projectId: projectId, runId: f.1,
-                signatureHash: f.0, category: f.2, title: f.3,
-                summary: "", severity: f.4, confidence: 0.87,
-                status: .open, firstSeenAt: now, lastSeenAt: now,
-                flow: f.5, screen: f.6, environment: "iPhone 16 Pro (iOS 17.5)",
-                occurrences: 1, aiAnalysis: f.7, suggestedFix: f.8
-            ))
+    func fetchArtifacts(runId: String) -> [QAArtifact] {
+        var items: [QAArtifact] = []
+        var stmt: OpaquePointer?
+        let sql = "SELECT * FROM artifacts WHERE run_id = ? ORDER BY created_at"
+        if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK {
+            bindText(stmt, 1, runId)
+            while sqlite3_step(stmt) == SQLITE_ROW {
+                items.append(QAArtifact(
+                    id: colText(stmt!, 0), runId: colText(stmt!, 1),
+                    type: colText(stmt!, 2), path: colText(stmt!, 3),
+                    metadata: colOptText(stmt!, 4), createdAt: parseDate(colText(stmt!, 5))
+                ))
+            }
         }
+        sqlite3_finalize(stmt)
+        return items
+    }
 
-        // Demo Integrations
-        let integrations: [(String, IntegrationType, String, String?, Bool)] = [
-            ("int-001", .github, "GitHub", "resilife-bot", true),
-            ("int-002", .jira, "Jira", "RESI", true),
-            ("int-003", .slack, "Slack", "#qa-alerts", true),
-            ("int-004", .email, "Email", nil, true),
-            ("int-005", .jenkins, "Jenkins", nil, true),
-        ]
-        for i in integrations {
-            insertIntegration(IntegrationConnection(
-                id: i.0, type: i.1, displayName: i.2,
-                accountIdentifier: i.3, isConnected: i.4,
-                createdAt: now, updatedAt: now
-            ))
+    // MARK: - Run Phase Events CRUD
+    func insertRunPhaseEvent(_ e: RunPhaseEvent) {
+        let sql = "INSERT INTO run_phase_events (id, run_id, phase, substep, status, timestamp, payload) VALUES (?,?,?,?,?,?,?)"
+        var stmt: OpaquePointer?
+        if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK {
+            bindText(stmt, 1, e.id); bindText(stmt, 2, e.runId)
+            bindText(stmt, 3, e.phase); bindText(stmt, 4, e.substep)
+            bindText(stmt, 5, e.status); bindText(stmt, 6, dateStr(e.timestamp))
+            bindText(stmt, 7, e.payload)
+            sqlite3_step(stmt)
         }
+        sqlite3_finalize(stmt)
+    }
+
+    func fetchRunPhaseEvents(runId: String) -> [RunPhaseEvent] {
+        var items: [RunPhaseEvent] = []
+        var stmt: OpaquePointer?
+        let sql = "SELECT * FROM run_phase_events WHERE run_id = ? ORDER BY timestamp"
+        if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK {
+            bindText(stmt, 1, runId)
+            while sqlite3_step(stmt) == SQLITE_ROW {
+                items.append(RunPhaseEvent(
+                    id: colText(stmt!, 0), runId: colText(stmt!, 1),
+                    phase: colText(stmt!, 2), substep: colOptText(stmt!, 3),
+                    status: colText(stmt!, 4), timestamp: parseDate(colText(stmt!, 5)),
+                    payload: colOptText(stmt!, 6)
+                ))
+            }
+        }
+        sqlite3_finalize(stmt)
+        return items
+    }
+
+    // MARK: - Delete All Data (for reset)
+    func deleteAllData() {
+        execute("DELETE FROM findings")
+        execute("DELETE FROM run_phase_events")
+        execute("DELETE FROM artifacts")
+        execute("DELETE FROM runs")
+        execute("DELETE FROM integration_connections")
+        execute("DELETE FROM projects")
     }
 }

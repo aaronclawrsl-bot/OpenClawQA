@@ -65,18 +65,26 @@ struct OverviewView: View {
 
             Button(action: { appState.startNewRun() }) {
                 HStack(spacing: 6) {
-                    Image(systemName: "play.fill")
-                        .font(.system(size: 10))
-                    Text("Run New Check")
+                    if appState.isRunning {
+                        ProgressView()
+                            .controlSize(.small)
+                            .scaleEffect(0.7)
+                    } else {
+                        Image(systemName: "play.fill")
+                            .font(.system(size: 10))
+                    }
+                    Text(appState.isRunning ? appState.currentPhaseDetail : "Run New Check")
                         .font(AppFont.subheading(13))
+                        .lineLimit(1)
                 }
                 .foregroundColor(.white)
                 .padding(.horizontal, AppSpacing.lg)
                 .padding(.vertical, AppSpacing.sm)
-                .background(AppColors.accentBlue)
+                .background(appState.isRunning ? AppColors.warning : AppColors.accentBlue)
                 .cornerRadius(6)
             }
             .buttonStyle(.plain)
+            .disabled(appState.isRunning)
 
             Button(action: {}) {
                 Image(systemName: "gearshape")
@@ -142,16 +150,18 @@ struct OverviewView: View {
                 Text("Recent Run")
                     .font(AppFont.heading(16))
                     .foregroundColor(AppColors.textPrimary)
-                Circle().fill(AppColors.success).frame(width: 6, height: 6)
-                Text(appState.latestRun?.startedAt?.formatted(date: .abbreviated, time: .shortened) ?? "--")
-                    .font(AppFont.caption())
-                    .foregroundColor(AppColors.textSecondary)
-                Image(systemName: "arrow.triangle.branch")
-                    .font(.system(size: 10))
-                    .foregroundColor(AppColors.textSecondary)
-                Text("Triggered by GitHub push")
-                    .font(AppFont.caption())
-                    .foregroundColor(AppColors.textSecondary)
+                if let run = appState.latestRun {
+                    Circle().fill(run.status == .completed ? AppColors.success : (run.status == .failed ? AppColors.error : AppColors.warning)).frame(width: 6, height: 6)
+                    Text(run.startedAt?.formatted(date: .abbreviated, time: .shortened) ?? "--")
+                        .font(AppFont.caption())
+                        .foregroundColor(AppColors.textSecondary)
+                    Image(systemName: "arrow.triangle.branch")
+                        .font(.system(size: 10))
+                        .foregroundColor(AppColors.textSecondary)
+                    Text("Triggered by \(run.triggerSource)")
+                        .font(AppFont.caption())
+                        .foregroundColor(AppColors.textSecondary)
+                }
                 Spacer()
             }
 
@@ -185,14 +195,13 @@ struct OverviewView: View {
     }
 
     private var demoScreenshots: [(String, String, String)] {
-        [
-            ("1", "ResiLife", "00:06"),
-            ("2", "Login", "00:15"),
-            ("3", "Home", "00:22"),
-            ("4", "Rewards", "00:28"),
-            ("5", "Community", "00:32"),
-            ("6", "Profile", "00:39"),
-        ]
+        guard let run = appState.latestRun, run.status == .completed else { return [] }
+        // Show screens based on actual coverage
+        let screens = ["Launch", "Login", "Home", "Feed", "Profile", "Settings"]
+        let explored = min(screens.count, run.flowsExplored)
+        return (0..<explored).map { i in
+            ("\(i+1)", screens[i], String(format: "%02d:%02d", i * 5, i * 7))
+        }
     }
 
     // MARK: - Coverage
@@ -228,10 +237,11 @@ struct OverviewView: View {
 
                 // Mini coverage chart placeholder
                 VStack(alignment: .leading, spacing: AppSpacing.xs) {
-                    coverageMiniBar("Screens", value: 0.92)
-                    coverageMiniBar("Flows", value: 0.85)
-                    coverageMiniBar("Actions", value: 0.78)
-                    coverageMiniBar("States", value: 0.71)
+                    let cov = appState.latestRun?.coveragePercent ?? 0
+                    coverageMiniBar("Screens", value: min(1.0, cov / 100))
+                    coverageMiniBar("Flows", value: min(1.0, cov * 0.9 / 100))
+                    coverageMiniBar("Actions", value: min(1.0, cov * 0.8 / 100))
+                    coverageMiniBar("States", value: min(1.0, cov * 0.7 / 100))
                 }
                 .frame(maxWidth: .infinity)
             }
@@ -397,50 +407,55 @@ struct StatCardView: View {
 
 // MARK: - Trend Chart
 struct TrendChartView: View {
-    let confidenceData: [Double] = [82, 85, 78, 84, 89, 86, 91, 88, 92, 87, 93, 90, 88, 91]
-    let criticalData: [Double] = [3, 2, 4, 3, 1, 2, 0, 1, 0, 2, 0, 1, 1, 2]
-    let highData: [Double] = [5, 6, 7, 5, 4, 5, 3, 4, 3, 5, 2, 4, 3, 4]
+    @EnvironmentObject var appState: AppState
+
+    var confidenceData: [Double] {
+        let runs = Array(appState.runs.reversed().suffix(14))
+        if runs.isEmpty { return [] }
+        return runs.map { Double($0.confidenceScore ?? 0) }
+    }
+
+    var criticalData: [Double] {
+        let runs = Array(appState.runs.reversed().suffix(14))
+        if runs.isEmpty { return [] }
+        return runs.map { Double($0.criticalFindings) }
+    }
+
+    var highData: [Double] {
+        let runs = Array(appState.runs.reversed().suffix(14))
+        if runs.isEmpty { return [] }
+        return runs.map { Double($0.highFindings) }
+    }
 
     var body: some View {
         GeometryReader { geo in
             let w = geo.size.width
             let h = geo.size.height
 
-            ZStack {
-                // Grid lines
-                ForEach(0..<4) { i in
-                    let y = h * Double(i) / 3.0
-                    Path { path in
-                        path.move(to: CGPoint(x: 0, y: y))
-                        path.addLine(to: CGPoint(x: w, y: y))
+            if confidenceData.isEmpty {
+                VStack {
+                    Spacer()
+                    Text("No run data yet")
+                        .font(AppFont.caption())
+                        .foregroundColor(AppColors.textTertiary)
+                    Spacer()
+                }
+                .frame(maxWidth: .infinity)
+            } else {
+                ZStack {
+                    ForEach(0..<4) { i in
+                        let y = h * Double(i) / 3.0
+                        Path { path in
+                            path.move(to: CGPoint(x: 0, y: y))
+                            path.addLine(to: CGPoint(x: w, y: y))
+                        }
+                        .stroke(AppColors.border.opacity(0.3), lineWidth: 0.5)
                     }
-                    .stroke(AppColors.border.opacity(0.3), lineWidth: 0.5)
+
+                    chartLine(data: confidenceData, maxVal: 100, color: AppColors.chartGreen, size: geo.size)
+                    chartLine(data: criticalData.map { $0 * 10 }, maxVal: 100, color: AppColors.chartRed, size: geo.size, dashed: true)
+                    chartLine(data: highData.map { $0 * 10 }, maxVal: 100, color: AppColors.chartOrange, size: geo.size, dashed: true)
                 }
-
-                // Confidence line
-                chartLine(data: confidenceData, maxVal: 100, color: AppColors.chartGreen, size: geo.size)
-
-                // Critical line (scaled)
-                chartLine(data: criticalData.map { $0 * 10 }, maxVal: 100, color: AppColors.chartRed, size: geo.size, dashed: true)
-
-                // High line (scaled)
-                chartLine(data: highData.map { $0 * 10 }, maxVal: 100, color: AppColors.chartOrange, size: geo.size, dashed: true)
-
-                // Date labels
-                HStack {
-                    Text("May 10")
-                    Spacer()
-                    Text("May 14")
-                    Spacer()
-                    Text("May 18")
-                    Spacer()
-                    Text("May 22")
-                    Spacer()
-                    Text("May 24")
-                }
-                .font(AppFont.caption(9))
-                .foregroundColor(AppColors.textTertiary)
-                .offset(y: h / 2 + 8)
             }
         }
     }
